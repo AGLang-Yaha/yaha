@@ -56,4 +56,4 @@ AGLang is a high-level language executed by interpreters, which makes it inheren
 
 ## Summary
 
-AGLang is a simple yet powerful addition to agent developers. By embracing an agent-oriented programming paradigm, AGLang makes it significantly easier to build LLM-based agents, while offering strong extensibility, robustness, and portability. An open-source AGLang programming environment, named YAHA, is available at http://xxx. Download it today and try your first agent program. Enjoy!
+AGLang is a simple yet powerful addition to agent developers. By embracing an agent-oriented programming paradigm, AGLang makes it significantly easier to build LLM-based agents, while offering strong extensibility, robustness, and portability. An open-source AGLang programming environment, named YAHA, is available at https://github.com/AGLang-Yaha/yaha. Download it today and try your first agent program. Enjoy!
