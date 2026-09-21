@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Stage-hook grammar: parsing, modifiers, strict errors and leak safety.
 
 A hook block is a stage property:

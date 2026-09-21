@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Guards the AgentClass authoring rule: no bare free-style text.
 
 The class template is INCLUDE-BASED (`templates/AgentClass.md` is a small root

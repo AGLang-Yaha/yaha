@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Shared output-size safety guard for the model-facing tools.
 
 A single tool result can otherwise consume the whole remaining context window:

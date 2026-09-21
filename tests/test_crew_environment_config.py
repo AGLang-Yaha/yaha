@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''Workspace crew-environment configuration contract.
 
 Validates THIS workspace's `.crew/environment.md` descriptor and `.crew/protocol.md`

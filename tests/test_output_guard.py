@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Tests for the shared tool-output safety guard.
 
 `read_file` and `bash_tool` can each return an arbitrarily large payload, which

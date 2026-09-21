@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Characters-to-tokens calibration for the context-occupancy instrument.
 
 YAHA used to treat a single hard-coded constant (4 characters per token, see

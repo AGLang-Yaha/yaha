@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''`-I/--include` extra class files must resolve inheritance like an include.
 
 An extra class file given on the command line is resolved EXACTLY as if its text

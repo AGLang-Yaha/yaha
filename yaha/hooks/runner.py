@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Hook execution engine.
 
 One :class:`HookEngine` per agent. It runs the four hook kinds declared on a

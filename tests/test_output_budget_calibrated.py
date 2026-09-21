@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """M1 guard: the tool-output budget must convert tokens to bytes at the CALIBRATED
 density, while the historical default (4 chars/token) stays byte-for-byte what the
 existing assertions pin.

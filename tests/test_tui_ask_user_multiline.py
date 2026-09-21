@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Regression tests for chat-style multi-line editing/pasting in ask_user.
 
 `prompt_user` gained an opt-in `multiline` flag. On a TTY with multiline=True

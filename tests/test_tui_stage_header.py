@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Regression tests: section headers include the active stage name.
 
 Expected format when UI knows the stage: `Agent (id) : Stage : Action`.

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''End-to-end tests for the two-agent echo example in ``examples/echo_agent``.
 
 The example is a REAL workspace example: two agent classes that inherit

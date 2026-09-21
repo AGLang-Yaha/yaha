@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''Regression tests for the DeepSeek streaming stall ("completely blocked").
 
 The provider's OpenAI client was constructed with no timeout, so the SDK

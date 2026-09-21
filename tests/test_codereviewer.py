@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Regression tests for the CodeReviewer agent class in AgentClass.md.
 
 The CodeReviewer class is a separate, long-running, read-only patch reviewer:

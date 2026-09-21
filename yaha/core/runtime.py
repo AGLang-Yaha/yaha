@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Cooperative multi-agent runtime for YAHA.
 
 Pure Python (stdlib only): no Rich, no UI, no LLM imports, so the whole module

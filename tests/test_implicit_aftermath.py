@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Aftermath is a built-in stage: it always exists, declared or not.
 
 Undeclared, it has no prompt, so a failure routed to it terminates the

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Stage hooks across the multi-agency runtime.
 
 The property under test is the strict one agreed with the user: a failing

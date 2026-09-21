@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''Regression tests for reaching the interrupt venue from ask_user.
 
 The ask_user editor can request the venue two ways: Ctrl+I, or submitting exactly

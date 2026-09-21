@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Persistent python kernel for stage hooks - the CHILD process.
 
 Started by :class:`yaha.hooks.kernel.PythonKernel` as

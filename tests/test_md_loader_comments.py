@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Tests for the <!--comment--> ... <!--endcomment--> block directive in md_loader.
 
 A comment block is author-facing only. It is stripped while the file is read -

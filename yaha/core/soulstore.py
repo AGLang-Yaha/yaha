@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Per-class identities inside the workspace SOUL.md.
 
 A workspace has ONE ``.yaha/SOUL.md``. It may carry a DEFAULT identity

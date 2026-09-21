@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''Unit tests for the cooperative multi-agent runtime primitives.
 
 Covers Event, the shared named EventRegistry, AgentHandle lifecycle and the

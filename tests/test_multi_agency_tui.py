@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''TUI multi-agent labelling: per-agent tags and the runtime status suffix.
 
 Section headers are unchanged for single-agent runs (so existing output stays

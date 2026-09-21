@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''Startup protection for Wait Events.
 
 Every Wait Event name must be produced by some literal set_event_success /
