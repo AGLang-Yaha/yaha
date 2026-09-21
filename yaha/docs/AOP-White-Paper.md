@@ -1,6 +1,7 @@
 # Agent-oriented Programming: a White Paper
 
 TAN, Kun (kuntan@gmail.com)
+
 Independent Researcher
 ## Introduction
 
