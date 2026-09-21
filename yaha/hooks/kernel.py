@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Parent side of the persistent python kernel used by stage hooks.
 
 One kernel per agent, spawned lazily on the first python hook, kept for the

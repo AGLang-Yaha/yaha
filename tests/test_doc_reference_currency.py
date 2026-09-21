@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 # Anti-dangle guard for the documentation rename.
 #
 # The open-source cleanup renamed yaha/docs/agentclass.md to

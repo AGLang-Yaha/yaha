@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 from google import genai
 from google.genai import types
 import os

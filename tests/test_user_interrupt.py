@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Unit tests for the interrupt helpers (no real TTY needed).
 
 The real Esc listener is TTY-only; these tests exercise listener state and the

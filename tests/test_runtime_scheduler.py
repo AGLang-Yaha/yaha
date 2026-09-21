@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''Scheduler tests for the cooperative, non-preemptive multi-agent runtime.
 
 Drives fake scripted agents so round-robin order, run-to-block, event

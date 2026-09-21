@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''spawn_parallel_agent tests: new vs clone context, authorization and handles.
 
 The engine registers a peer on the cooperative runtime (non-blocking). 'new'

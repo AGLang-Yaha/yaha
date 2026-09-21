@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Regression guards for the complete removal of the task.md subsystem.
 
 The per-class `.yaha/memory/<class>/task.md` task history was removed because a

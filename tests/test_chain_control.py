@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''Pure unit tests for the prompt-chain control layer (yaha.core.chain).
 
 No Agent, no UI, no LLM: `chain.py` is stdlib-only, so the walk/budget rules can

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Regression tests for API retry exhaustion: user wait/break flow.
 
 Covers both the original fix (retry round 10, wait/break prompt, provider errors

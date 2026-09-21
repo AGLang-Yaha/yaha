@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''Tests for the interrupt diagnose venue (chat + slash commands).
 
 The venue replaced the old bare-keyword scratchpad. The contract under test:

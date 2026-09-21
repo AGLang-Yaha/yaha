@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''Regression tests for the prompt guard that protects the first keystroke.
 
 The Esc interrupt listener owns stdin in cbreak mode and discards non-ESC bytes

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''Tests for the silent recovered-error log.
 
 The agent records errors it silently recovers from (API retries) into

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 # Code-grounded guards for README.md.
 #
 # The README is only trustworthy while it agrees with the repository and the

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """HookEngine: ordering, bash/python execution, gating, capture, reporting.
 
 The engine is deliberately easy to drive without an agent: it only needs the

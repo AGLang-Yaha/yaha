@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """The read-only `yaha` DOM: live snapshot content + read-only enforcement.
 
 `build_snapshot` reads the live agent in the parent process and materialises a

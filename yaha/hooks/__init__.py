@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Stage hooks for YAHA agents.
 
 Four hook kinds can be declared as stage properties in ``AgentClass.md``:

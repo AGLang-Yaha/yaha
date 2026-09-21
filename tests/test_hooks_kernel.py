@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Persistent python kernel: state, failure, timeout, death, isolation.
 
 The kernel is a real subprocess, one per agent, so these tests spawn it. They

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """B5: the characters-to-tokens calibration must track observations and must model a
 constant per-request framing term instead of folding it into density (review F4).
 """

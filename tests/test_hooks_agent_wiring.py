@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """End-to-end stage hooks through the real Agent, engine and tool plumbing.
 
 A scripted provider and probe AgentClasses drive the hook points. Hooks append

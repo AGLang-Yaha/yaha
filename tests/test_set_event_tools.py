@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''Tests for the set_event_success / set_event_loop stage-exit tools.
 
 They are framework tools (always callable, exempt from the stage exit-tool

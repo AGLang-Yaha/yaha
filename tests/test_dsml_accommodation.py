@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''Tests for the DeepSeek DSML tool-call accommodation.
 
 DeepSeek flash models sometimes bypass the harness <tool_code> format and emit

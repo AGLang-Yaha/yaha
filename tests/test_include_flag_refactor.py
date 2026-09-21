@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''`-I/--include` loads each class file as its OWN document.
 
 An extra class file is NOT text-joined with the workspace's `AgentClass.md` -

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 TAN Kun
+
 const { Plugin, Modal, Setting, Notice, PluginSettingTab } = require("obsidian");
 const child_process = require("child_process");
 const path = require("path");

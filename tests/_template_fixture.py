@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Shared fixture for the shipped class template.
 
 Canonical moved to an INCLUDE-BASED template layout: ``templates/AgentClass.md``

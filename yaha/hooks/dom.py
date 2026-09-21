@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Read-only DOM for python hooks.
 
 A python hook runs in a separate persistent kernel process, so it cannot touch

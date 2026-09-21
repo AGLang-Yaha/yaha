@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Shared fixture for the context-compression guards (B1-B6).
 
 Leading underscore: kept out of the test_*.py glob the reference runner uses.

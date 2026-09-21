@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """B1/B3/B4: one instrument for occupancy, an independent strict watermark, and no
 per-turn L1 thrash.
 

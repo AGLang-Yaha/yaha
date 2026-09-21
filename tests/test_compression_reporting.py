@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """B2/B6: the occupancy report must mark estimates, must not hide an over-window
 reading, and must express before/after in ONE instrument.
 

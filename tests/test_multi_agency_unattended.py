@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''Multi-agency in unattended / non-TTY runs.
 
 The event/wait machinery is deterministic and needs no TTY; only the TUI tag

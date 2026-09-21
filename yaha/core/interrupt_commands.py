@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Declarative slash-command vocabulary for the interrupt diagnose venue.
 
 The interrupt stage is a diagnostic venue: any free text that is NOT a slash

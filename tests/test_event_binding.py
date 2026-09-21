@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''Tests for late binding of events: the `@placeholder` + `bind_tool` feature.
 
 A placeholder (`@name`) is bound at runtime to a REAL event name by

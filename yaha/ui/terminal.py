@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.live import Live

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''Tests for remote agent communication via ENDPOINTS (service EPs and CEPs).
 
 An EP is BOTH an event name and a message queue, addressed as

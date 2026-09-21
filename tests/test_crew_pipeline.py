@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 '''Crew coder-reviewer pipeline: contract + end-to-end tests.
 
 Contract tests assert that the three Crew AgentClasses in the shipped

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """Remote agent communication through ENDPOINTS (EPs).
 
 An ENDPOINT is addressed by a URL - ``http(s)://host[:port]/path/version`` - and

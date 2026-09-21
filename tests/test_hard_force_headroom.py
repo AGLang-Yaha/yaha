@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 TAN Kun
+
 """M0 + M3 guards for the revision round.
 
 M0: the strict emergency watermark must leave room for one MAXIMUM request, otherwise the
