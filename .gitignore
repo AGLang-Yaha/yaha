@@ -1,0 +1,64 @@
+# YAHA Workspace Artifacts
+papers/
+pages/
+md-papers/
+temps/
+reference-analysis.md
+*.md-citation.md
+*.md-summary.md
+
+# OS / IDE
+.DS_Store
+.obsidian/
+*.canvas
+*.base
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env/
+bin/
+
+# YAHA Logs (Trajectories)
+.yaha/logs/
+.yaha/task.md
+.yaha/memory/
+.yaha/ext/
+
+# Benchmarking
+bench/.yaha/
+bench/results.json
+bench/test_run.log
+
+# Test folders
+test_init_default/
+test_memory_git/
+test_package/
+test_upgrade/
+test_issue44/
+ws1/

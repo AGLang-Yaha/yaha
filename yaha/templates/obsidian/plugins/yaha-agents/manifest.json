@@ -1,0 +1,9 @@
+{
+  "id": "yaha-agents",
+  "name": "YAHA Agents",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "Interactive mouse-driven AI coauthor with real-time thought streaming and live Diff preview.",
+  "author": "YAHA",
+  "isDesktopOnly": true
+}

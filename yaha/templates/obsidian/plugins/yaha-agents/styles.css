@@ -1,0 +1,235 @@
+/* Styles for YAHA Agents Obsidian Plugin */
+
+.yaha-modal-title {
+  font-size: 1.5em;
+  font-weight: bold;
+  margin-bottom: 15px;
+  color: var(--text-accent);
+}
+
+.yaha-form-container {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-bottom: 15px;
+}
+
+.yaha-form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.yaha-form-label {
+  font-weight: bold;
+  font-size: 0.9em;
+  color: var(--text-muted);
+}
+
+.yaha-select, .yaha-textarea {
+  width: 100%;
+  background-color: var(--background-modifier-form-field);
+  border: 1px solid var(--background-modifier-border);
+  color: var(--text-normal);
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 0.95em;
+}
+
+.yaha-select:focus, .yaha-textarea:focus {
+  border-color: var(--interactive-accent);
+  outline: none;
+}
+
+.yaha-textarea {
+  min-height: 80px;
+  resize: vertical;
+  font-family: inherit;
+  user-select: text !important;
+  -webkit-user-select: text !important;
+  cursor: text;
+}
+
+.yaha-textarea:read-only,
+.yaha-textarea:-moz-read-only {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+  cursor: text;
+}
+
+/* Ensure every text element inside the YAHA modal can be selected and copied */
+.yaha-modal,
+.yaha-modal * {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+  pointer-events: auto !important;
+}
+
+.yaha-checkbox-container {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 5px;
+}
+
+.yaha-checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.yaha-checkbox {
+  cursor: pointer;
+  width: 16px;
+  height: 16px;
+}
+
+.yaha-console-container {
+  margin-top: 15px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.yaha-console {
+  background-color: #1e1e1e;
+  color: #d4d4d4;
+  font-family: var(--font-monospace), monospace;
+  font-size: 0.85em;
+  padding: 12px;
+  border-radius: 6px;
+  max-height: 150px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  border: 1px solid #333;
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+
+.yaha-diff-container {
+  margin-top: 15px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  overflow: hidden;
+  max-height: 250px;
+  overflow-y: auto;
+  background-color: var(--background-primary);
+}
+
+.yaha-diff-header {
+  background-color: var(--background-secondary-alt);
+  padding: 6px 12px;
+  font-weight: bold;
+  font-size: 0.85em;
+  border-bottom: 1px solid var(--background-modifier-border);
+  color: var(--text-muted);
+}
+
+.yaha-diff-body {
+  font-family: var(--font-monospace), monospace;
+  font-size: 0.9em;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  user-select: text !important;
+  -webkit-user-select: text !important;
+}
+
+.yaha-diff-line {
+  padding: 2px 12px;
+  display: block;
+}
+
+.yaha-diff-del {
+  background-color: rgba(255, 0, 0, 0.12);
+  color: #ea4335;
+  text-decoration: line-through;
+}
+
+.yaha-diff-add {
+  background-color: rgba(0, 255, 0, 0.12);
+  color: #34a853;
+}
+
+.yaha-diff-unchanged {
+  color: var(--text-normal);
+}
+
+.yaha-button-group {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 20px;
+}
+
+.yaha-spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--text-muted);
+  border-radius: 50%;
+  border-top-color: var(--interactive-accent);
+  animation: yaha-spin 1s ease-in-out infinite;
+  margin-right: 8px;
+  vertical-align: middle;
+}
+
+@keyframes yaha-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Draggable/resizable modal overrides */
+.yaha-draggable-modal {
+  min-width: 420px;
+  min-height: 320px;
+  max-width: none !important;
+  /* Keep Obsidian's default max-height/overflow so the modal scrolls when
+     content is taller than the viewport. */
+}
+
+.yaha-drag-handle {
+  cursor: grab;
+  user-select: none !important;
+  -webkit-user-select: none !important;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.yaha-is-dragging .yaha-drag-handle,
+.yaha-is-dragging .yaha-drag-handle * {
+  cursor: grabbing !important;
+}
+
+.yaha-resize-handle {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  width: 14px;
+  height: 14px;
+  cursor: nwse-resize;
+  z-index: 10;
+  background: linear-gradient(135deg, transparent 50%, var(--background-modifier-border) 50%);
+  border-bottom-right-radius: var(--radius-s);
+}
+
+.yaha-resize-handle:hover {
+  background: linear-gradient(135deg, transparent 50%, var(--interactive-accent) 50%);
+}
+
+.yaha-is-resizing,
+.yaha-is-resizing * {
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+
+/* Keep disabled form controls selectable so users can copy their contents */
+.yaha-modal textarea:disabled,
+.yaha-modal select:disabled,
+.yaha-modal input:disabled {
+  user-select: text !important;
+  -webkit-user-select: text !important;
+  pointer-events: auto !important;
+  cursor: text;
+  opacity: 0.85;
+}
