@@ -429,7 +429,6 @@
     - **Allowed Tools:**
         - read_file
         - list_files
-        - ask_user
         - exit_to
         - set_event_success
     - **Exit Tools:**
@@ -439,10 +438,7 @@
     > - Goal: react to the reviewer's verdict by starting the NEXT ROUND, or by handing a commit request to the lead. This stage NEVER finishes the chain.
     > - Step 1: Read the newest `<id>.review.md` in the descriptor's `Exchange Folder` (and the patch it reviews). The reviewer overwrites that file every round, so what you read is this round's verdict.
     > - Step 2: If the review says REQUEST_CHANGES, call `exit_to(name='Plan', summary=<the review feedback plus: revise and re-export the SAME <id>.patch>)`. Jumping back to Plan means the human re-approves the revision plan before you code again.
-    > - Step 3: If the review says APPROVE, call `ask_user` and ask what to do next: commit this approved round to the main repo, start the next coding task, or quit.
-    >   - If the user wants to COMMIT: call `set_event_success('', 'commit_ready')`. That signals the lead's gated commit gate and advances you to `CommitWait`, where you PARK so the user's terminal is free for the lead's merge confirmation. Do not touch the main repository yourself.
-    >   - If the user gives a new task or feedback: call `exit_to(name='Preamble', summary=<the new task or feedback>)` with it.
-    >   - If the user answers quit/stop/exit: call `exit_to(name='Preamble', summary=<quit: end the crew through the Preamble quit path, which writes DONE and releases the reviewer>)`.
+    > - Step 3: If the review says APPROVE, call `set_event_success('', 'commit_ready')`. That signals the lead's gated commit gate and advances you to `CommitWait`, where you PARK so the user's terminal is free for the lead's merge confirmation. Do not touch the main repository yourself.
     > - Step 4: Never re-implement here and never call a finishing tool: the chain can only end through Aftermath.
 
 - **CommitWait:**
