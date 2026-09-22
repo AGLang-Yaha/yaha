@@ -18,6 +18,11 @@ import unicodedata
 
 console = Console()
 
+# Truncation marker appended to a clipped line. The marker text consumes
+# terminal cells itself, so YAHAUI._clip_line budgets it INSIDE the caller's
+# limit - otherwise the "clipped" line would still be wider than the console.
+_CLIP_MARKER = "…[+{} chars]"
+
 # Multi-agency status shared by every agent's YAHAUI instance: all instances
 # draw to the same module-level console, so the live-agent count and the
 # active agent live in one place and stay consistent whichever agent prints.
@@ -236,20 +241,65 @@ class YAHAUI:
     def _line_width(self, line):
         return sum(self._char_cell_width(ch) for ch in line)
 
-    def _clip_line(self, line, limit):
-        """Clip a single source line so it no longer overflows the console width."""
-        if not line or self._line_width(line) <= limit:
+    def _hard_clip(self, line, limit):
+        """Clip ``line`` to at most ``limit`` terminal cells, without a marker.
+
+        The last-resort fallback: when the budget is too small to also hold the
+        truncation marker, drop the marker rather than overflow the display.
+        """
+        limit = int(limit)
+        if not line or limit <= 0:
+            return ""
+        if self._line_width(line) <= limit:
             return line
         used = 0
         out = []
-        for idx, ch in enumerate(line):
+        for ch in line:
             w = self._char_cell_width(ch)
             if used + w > limit:
-                out.append(f"…[+{len(line) - idx} chars]")
                 break
             out.append(ch)
             used += w
         return "".join(out)
+
+    def _clip_line(self, line, limit):
+        """Clip a single source line so the WHOLE line fits the console width.
+
+        The truncation marker occupies terminal cells, so it is budgeted INSIDE
+        ``limit`` (plus one spare cell of slack) instead of being appended after
+        the content was already clipped to ``limit``. Appending it afterwards -
+        the previous behaviour - produced strings up to
+        ``limit + marker_width`` cells wide, i.e. exactly the over-wide repaint
+        this helper exists to prevent. When even the marker cannot fit, fall
+        back to a marker-free truncation rather than ever overflowing.
+        """
+        limit = int(limit)
+        if not line or limit <= 0:
+            return ""
+        if self._line_width(line) <= limit:
+            return line
+        # Reserve room for the widest marker this line could produce: the count
+        # of dropped characters is largest at the FIRST clip point, so reserving
+        # against ``len(line)`` is a safe upper bound for the actual marker.
+        reserve = self._line_width(_CLIP_MARKER.format(len(line)))
+        budget = limit - reserve - 1  # -1: conservative spare cell
+        if budget >= 1:
+            used = 0
+            out = []
+            for idx, ch in enumerate(line):
+                w = self._char_cell_width(ch)
+                if used + w > budget:
+                    out.append(_CLIP_MARKER.format(len(line) - idx))
+                    break
+                out.append(ch)
+                used += w
+            clipped = "".join(out)
+            # Defensive: the reserve above should make this unreachable.
+            if self._line_width(clipped) <= limit:
+                return clipped
+        # No room for the marker (tiny limit) or a measurement surprise: degrade
+        # to a marker-free truncation instead of overflowing the display.
+        return self._hard_clip(line, limit)
 
     def _fit_text(self, text, max_lines=None, tail_lines=0):
         """Make arbitrary UI text safe for the TUI:
@@ -267,11 +317,22 @@ class YAHAUI:
             return text
         text_str = str(text)
         width = self._console_width()
-        # Leave a little slack so nested/bordered renderables stay on screen.
-        content_width = max(width - 4, 40)
+        # Leave a little slack so nested/bordered renderables stay on screen,
+        # but never let the budget reach or exceed the console width: a hard
+        # floor (the old `max(width - 4, 40)`) ignored narrow terminals and let
+        # an emitted line be wider than the display.
+        content_width = max(min(width - 4, width - 1), 1)
         clipped_lines = []
         for line in text_str.splitlines():
             clipped_lines.append(self._clip_line(line, content_width))
+
+        def truncation_marker(count):
+            # Route the marker through the same clip so it cannot itself exceed
+            # a narrow console; on normal widths it is returned unchanged.
+            return self._clip_line(
+                f"... [{count} more lines truncated]", content_width
+            )
+
         if max_lines and len(clipped_lines) > max_lines:
             dropped = len(clipped_lines)
             if tail_lines > 0 and max_lines > tail_lines + 1:
@@ -279,10 +340,10 @@ class YAHAUI:
                 head = clipped_lines[:keep_head]
                 tail = clipped_lines[-tail_lines:]
                 dropped = len(clipped_lines) - keep_head - tail_lines
-                clipped_lines = head + [f"... [{dropped} more lines truncated]"] + tail
+                clipped_lines = head + [truncation_marker(dropped)] + tail
             else:
                 dropped = len(clipped_lines) - max_lines
-                clipped_lines = clipped_lines[:max_lines] + [f"... [{dropped} more lines truncated]"]
+                clipped_lines = clipped_lines[:max_lines] + [truncation_marker(dropped)]
         return "\n".join(clipped_lines)
 
     def display_thought(self, agent_name, agent_id, thought):
@@ -329,11 +390,13 @@ class YAHAUI:
             elif tool_name == "load_skill":
                 summary = args.get("name", "")
 
-            tool_line = Text(f"  {tool_name} ", style="yellow")
+            prefix = f"  {tool_name} "
+            tool_line = Text(prefix, style="yellow")
             # Clip over-length arguments so one huge line cannot flood the TUI.
-            # Account for the fixed prefix (indent + tool name) and a little slack
-            # so the whole assembled line still fits within the console width.
-            available = max(self._console_width() - len(f"  {tool_name} ") - 2, 20)
+            # Budget against the prefix's CELL width (not its codepoint count)
+            # and leave slack; no hard floor, since a floor can itself exceed a
+            # narrow terminal and push the assembled line past the display width.
+            available = max(self._console_width() - self._line_width(prefix) - 2, 1)
             summary = self._clip_line(str(summary), available)
             tool_line.append(summary, style="white")
             self.console.print(tool_line)
