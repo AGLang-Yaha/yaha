@@ -389,7 +389,7 @@
 ## CrewCda
 - **Inherited:** CodeAgent
 - **Code:** Cwd
-- **Description:** Multi-round crew coder. The interactive CodeAgent chain (Preamble, Plan, Approve, Coding, Summary, CommitWait, Aftermath) wired into the coder-reviewer pipeline: Coding follows the workspace environment descriptor, publishes the round's patch and sets the code_ready event; Summary waits on review_done and jumps back - to Plan to revise the same patch on REQUEST_CHANGES, to Preamble to ask the user for a new coding task on APPROVE, or to relay a commit request to the lead; CommitWait parks until the lead signals that the commit is done; the user quits at Preamble, which routes to Aftermath.
+- **Description:** Multi-round crew coder. The interactive CodeAgent chain (Preamble, Plan, Approve, Coding, Summary, CommitWait, Aftermath) wired into the coder-reviewer pipeline: Coding follows the workspace environment descriptor, publishes the round's patch and sets the code_ready event; Summary waits on review_done and jumps back - to Plan to revise the same patch on REQUEST_CHANGES, or to relay a commit request to the lead on APPROVE; CommitWait parks until the lead signals that the commit is done, after which the coder returns to Preamble to ask the user for the next coding task; the user quits at Preamble, which routes to Aftermath.
 - **Max Loops:** -1
 - **System Prompt:**
     - **Inherited:** All
@@ -399,7 +399,7 @@
     > - You still ask the human to approve your PLAN (Plan and Approve stages) and every REVISION plan; the Coding stage itself never asks for approval.
     > - Round protocol: work inside the descriptor's `Worktree Root`, publish this round's patch into its `Exchange Folder`, and end the Coding stage with `set_event_success('', 'code_ready')`; then WAIT at Summary until the reviewer publishes `review_done`.
     > - At the start of every round read the newest `<id>.merge.md` in the descriptor's `Merge Record Dir` to learn what the lead already landed, and sync your worktree if the plan calls for it.
-    > - Summary loops or relays and never finishes the chain: on `REQUEST_CHANGES` revise and re-export the SAME patch id; on `APPROVE` ask the user for the next coding task; when the user asks you to commit, call `set_event_success('', 'commit_ready')` and park in CommitWait until the lead signals `commit_done`.
+    > - Summary loops or relays and never finishes the chain: on `REQUEST_CHANGES` revise and re-export the SAME patch id; on `APPROVE` relay the commit request to the lead by calling `set_event_success('', 'commit_ready')` and park in CommitWait until the lead signals `commit_done` - do NOT ask the user in Summary; the next coding task, or quit, is chosen at the Preamble after the commit gate.
     > - The user ends the crew by answering quit (stop/exit) at your Preamble: that routes to your Aftermath, which writes `crew.status` = `DONE` into the exchange folder and signals `code_ready` one last time so the parked reviewer exits gracefully and relays the finish to the lead. Never leave the reviewer parked.
 
 - **Preamble:**
@@ -429,7 +429,6 @@
     - **Allowed Tools:**
         - read_file
         - list_files
-        - ask_user
         - exit_to
         - set_event_success
     - **Exit Tools:**
@@ -439,11 +438,8 @@
     > - Goal: react to the reviewer's verdict by starting the NEXT ROUND, or by handing a commit request to the lead. This stage NEVER finishes the chain.
     > - Step 1: Read the newest `<id>.review.md` in the descriptor's `Exchange Folder` (and the patch it reviews). The reviewer overwrites that file every round, so what you read is this round's verdict.
     > - Step 2: If the review says REQUEST_CHANGES, call `exit_to(name='Plan', summary=<the review feedback plus: revise and re-export the SAME <id>.patch>)`. Jumping back to Plan means the human re-approves the revision plan before you code again.
-    > - Step 3: If the review says APPROVE, call `ask_user` and ask what to do next: commit this approved round to the main repo, start the next coding task, or quit.
-    >   - If the user wants to COMMIT: call `set_event_success('', 'commit_ready')`. That signals the lead's gated commit gate and advances you to `CommitWait`, where you PARK so the user's terminal is free for the lead's merge confirmation. Do not touch the main repository yourself.
-    >   - If the user gives a new task or feedback: call `exit_to(name='Preamble', summary=<the new task or feedback>)` with it.
-    >   - If the user answers quit/stop/exit: call `exit_to(name='Preamble', summary=<quit: end the crew through the Preamble quit path, which writes DONE and releases the reviewer>)`.
-    > - Step 4: Never re-implement here and never call a finishing tool: the chain can only end through Aftermath.
+    > - Step 3: If the review says APPROVE, call `set_event_success('', 'commit_ready')`. That signals the lead's gated commit gate and advances you to `CommitWait`, where you PARK so the user's terminal is free for the lead's merge confirmation. Do not touch the main repository yourself.
+    > - Step 4: Act ONLY on the review of the patch YOU published this round; never fire `code_ready` from here and never re-implement. Never call a finishing tool: the chain can only end through Aftermath, reached when the user answers quit (stop/exit) at your Preamble - that writes `crew.status` = `DONE` and releases the reviewer.
 
 - **CommitWait:**
     - **Wait Event:** commit_done
