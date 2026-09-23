@@ -24,6 +24,13 @@
     - **Final Answer:** True
 - **Compression:**
     - **Detached:** True
+    - **Allowed Tools:**
+        - read_file
+        - list_files
+        - grep_files
+        - create_file
+        - edit_file
+        - bash_tool
     > CONTEXT SNAP HANDLER
     > The conversation context has crossed the configured threshold. Persist
     > any durable facts/decisions to the Memory folder (files under
