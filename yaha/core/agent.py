@@ -2478,6 +2478,7 @@ class Agent:
         fail_target = self._stage_failure_target(stage)
         tools_called = set()
         stage_turn = 0
+        claim_bounces = 0
 
         # If allowed_tools is specified, ensure required and exit tools are callable.
         effective_allowed = None
@@ -2540,7 +2541,10 @@ class Agent:
                     self._record_usage(usage)
                 
                 # API-level failure: provider returned an error string / no usable text.
-                api_error = (not response or not response.strip() or response.startswith("Error calling "))
+                api_error = (
+                    not isinstance(response, str)
+                    or not response.strip()
+                    or response.startswith("Error calling "))
                 if api_error:
                     last_failure_hint = str(response or "API call returned an empty response").strip()
                     # Silent recovery log: this failure is absorbed by a retry.
@@ -2651,11 +2655,22 @@ class Agent:
                     turn += 1
                     continue
 
+                if self._has_real_observation():
+                    # A real observation resets the counter: only CONSECUTIVE
+                    # ungrounded claims are bounded.
+                    claim_bounces = 0
                 observation_error = self._observation_error(response, check_claims=True)
                 if observation_error is not None:
                     error_msg = 'Error: ' + observation_error
                     self.history.append({"role": "user", "content": error_msg})
                     self.ui.display_error(self.config.name, self.agent_id, error_msg)
+                    claim_bounces += 1
+                    if claim_bounces >= self.llm_retry_limit:
+                        error_msg = ('Error: the model kept claiming a verified outcome '
+                                     'without any observation after %d attempts.' % claim_bounces)
+                        self.history.append({"role": "user", "content": error_msg})
+                        self.ui.display_error(self.config.name, self.agent_id, error_msg)
+                        return error_msg, "ERROR", turn
                     turn += 1
                     continue
 

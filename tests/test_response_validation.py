@@ -245,3 +245,59 @@ class TestObservationGuardsEndToEnd(unittest.TestCase):
                               'content': 'TOOL RESULT (loop_tool):\n- **Status**: SUCCESS'})
         self.assertTrue(agent._has_real_observation())
         self.assertIsNone(agent._observation_error(claim, check_claims=True))
+
+    def test_non_string_reply_is_bounced_end_to_end(self):
+        # A truthy non-string reply must not reach `.strip()` in the caller's
+        # api_error check: the run has to survive it and finish on the next turn.
+        agent = self._agent()
+        mock_llm = MockLLMProvider()
+        mock_llm.responses = [42, 'plain final answer']
+        agent.llm = mock_llm
+        result = agent.run('task')
+        self.assertEqual(result, 'plain final answer')
+        self.assertGreaterEqual(mock_llm.calls, 2)
+
+    def test_claim_retry_is_bounded(self):
+        agent = self._agent()
+        agent.llm_retry_limit = 2
+        claim = 'the tests passed, nothing else to do'
+        mock_llm = MockLLMProvider()
+        mock_llm.responses = [claim] * 6
+        agent.llm = mock_llm
+        try:
+            agent.run('task')
+        except Exception:
+            # A bounded failure may surface as an exception; what matters is that
+            # the loop terminated instead of spinning on the same claim.
+            pass
+        self.assertLessEqual(mock_llm.calls, 4)
+        history = '\n'.join(str(m.get('content', '')) for m in agent.history)
+        self.assertIn('kept claiming', history)
+
+    def test_compressed_observation_counts_as_real(self):
+        agent = self._agent()
+        self.assertFalse(agent._has_real_observation())
+        agent.history.append({'role': 'user',
+                              'content': 'COMPRESSED TOOL RESULT (loop_tool): kept for context'})
+        self.assertTrue(agent._has_real_observation())
+        self.assertIsNone(agent._observation_error('the tests passed', check_claims=True))
+
+    def test_multiple_distinct_calls_rejected_end_to_end(self):
+        both = _block(_call('read_file')) + _block(_call('write_file'))
+        agent, result = self._run([both, 'plain final answer'])
+        self.assertEqual(result, 'plain final answer')
+        history = '\n'.join(str(m.get('content', '')) for m in agent.history)
+        self.assertIn('ONE call per turn', history)
+
+    def test_nested_open_tag_limitation_is_pinned(self):
+        # Pre-existing limitation, unchanged by this round: when a call argument
+        # quotes a literal OPEN tag, the parser starts from that inner tag, the
+        # JSON cannot be recovered, and the reply is bounced as malformed. Pinned
+        # here so a future fix must update this expectation deliberately.
+        inner = 'quote ' + _TOOL_OPEN + ' inside'
+        response = _block('{' + _Q + 'tool' + _Q + ': ' + _Q + 'create_file' + _Q + ', '
+                          + _Q + 'args' + _Q + ': {' + _Q + 'content' + _Q + ': '
+                          + _Q + inner + _Q + '}}')
+        tool, err = Agent.validate_response(None, response)
+        self.assertIsNone(tool)
+        self.assertIn('Malformed tool block', err)
