@@ -199,6 +199,14 @@ class Agent:
         # One-shot remote notice set by an endpoint wait ([REMOTE MESSAGE] /
         # [REMOTE CONNECTION]); appended to the stage prompt, then cleared.
         self._remote_notice = ""
+        # SNAP MARKER: the last context snapshot, recorded so a snap is a VISIBLE,
+        # attributable event rather than a silent history swap. `signalled` lists
+        # the multi-agent events the current stage had already emitted when the
+        # snap fired.
+        self._snap_marker = None
+        # Events the CURRENT stage has signalled; cleared at each stage entry so
+        # the marker reports only this stage's signals.
+        self._stage_signalled_events = set()
         self._last_prompt_tokens = 0
         # Character count of the history at the moment `_last_prompt_tokens` was
         # reported. None means "no baseline recorded", in which case the anchor is
@@ -817,8 +825,13 @@ class Agent:
             self.runtime.set_event(name)
 
     def _set_events(self, names):
-        """Signal every named event."""
+        """Signal every named event, recording it for the SNAP MARKER."""
         for name in names or []:
+            if name:
+                try:
+                    self._stage_signalled_events.add(str(name))
+                except Exception:
+                    pass
             self._set_event(name)
 
     def set_event_success(self, summary="", *event_names, **kwargs):
@@ -1056,6 +1069,21 @@ class Agent:
         together, and the deferred signal is reported as a blocked signal so the
         runtime's deadlock diagnostic can name each one.
         """
+        if self._compressing and tool_name in ("set_event_success",
+                                               "set_event_loop",
+                                               "set_event_jump"):
+            # A compression/snap handler is a PLAIN-TEXT digest producer: its run
+            # must NEVER signal a multi-agent event. Otherwise the handler can
+            # re-emit a stage's own signal (e.g. a duplicate code_ready), which
+            # latches and desynchronises the crew gates - the reviewer reviews a
+            # stale patch and the Summary runs a round early, then the LEAD is left
+            # parked and the runtime reports a deadlock. The guard sits BEFORE the
+            # hook-engine lookup on purpose: the handler stage declares no hooks, so
+            # the engine-free path would otherwise call the tool impl and signal.
+            return ("Error: %s is not allowed inside a compression/snap handler; "
+                    "reply with a plain-text digest, not a tool call." % tool_name,
+                    None, True)
+
         engine = self._hooks(stage)
         if engine is None:
             return self._call_tool(tool_name, args), None, True
@@ -1658,6 +1686,8 @@ class Agent:
                 # Tell the TUI which prompt-chain stage is active so section
                 # headers read `Agent (id) : <Stage> : <Action>`.
                 self.ui.set_stage_name(stage['name'])
+                # A fresh stage entry starts a fresh signal ledger for the SNAP MARKER.
+                self._stage_signalled_events = set()
 
                 # Display stage transition if multiple stages
                 if walk.stage_count > 1:
@@ -1992,6 +2022,13 @@ class Agent:
             f'listener    active  cbreak={ctl.cbreak_now}'
             if ctl is not None and ctl.active else 'listener    absent'
         )
+        snap = getattr(self, '_snap_marker', None)
+        if snap:
+            snap_line = ('snap        %s stage=%s phase=%s signalled=%s'
+                         % (snap.get('when'), snap.get('stage'),
+                            snap.get('phase'), snap.get('signalled') or 'none'))
+        else:
+            snap_line = 'snap        none'
         lines = [
             'runtime truth (no model involved)',
             f'agent       {self.config.name}  id={self.agent_id}  caller={caller}',
@@ -2006,6 +2043,7 @@ class Agent:
             f'history     {len(self.history)} messages   last: {last_msg}',
             f'last tool   {last_tool}',
             f'interrupt   pending={esc_pending}  deferred={self._pending_interrupt_status or "none"}  serving={self._serving_interrupt}  compressing={self._compressing}',
+            snap_line,
             listener_line,
             f'retry       limit {self.llm_retry_limit}/round  unattended max {self.api_retry_unattended_max_rounds}',
         ]
@@ -2914,7 +2952,7 @@ class Agent:
         suffix = " (est.)" if self._usage_is_estimated() else ""
         return f"Ctx usage: {pct:g}% ({used // 1000}K/{total // 1000}K){suffix}"
 
-    def _maybe_snap(self, stage, turn, force=False):
+    def _maybe_snap(self, stage, turn, force=False, phase="stage-end"):
         """Run context compression (opt-in stage Snap: enabled, or forced).
 
         Runs the class-level Snap Handler — a detached stage — through the
@@ -2996,6 +3034,10 @@ class Agent:
             note = (f"Snap handler '{handler_name}' after stage '{stage_name}'. "
                     f"~{before_tokens} -> ~{final_tokens} tokens (est.).")
             self.logger.log_compression_restart(self.history, note)
+            # SNAP MARKER: a compression must be VISIBLE and attributable - record
+            # when it happened, in which stage, and which events that stage had
+            # already signalled.
+            self.logger.log_compression(self._mark_snap(stage_name, phase))
             self.ui.display_compression(self.config.name, self.agent_id,
                                         before_tokens, final_tokens, "SNAP", self.compress_count)
 
@@ -3013,6 +3055,39 @@ class Agent:
             return turn
         finally:
             self._compressing = False
+
+    def _mark_snap(self, stage_name, phase, history=True):
+        """Record + surface a SNAP MARKER; returns the one-line marker text.
+
+        A context snapshot REWRITES the stage, so it must be visible and
+        attributable: it records WHEN it fired, the STAGE it hit and the phase
+        (stage-end or mid-stage), and which multi-agent EVENTS that stage had
+        already signalled. The text is returned for the caller to log; when
+        `history` is True (the handler Snap path) it is also appended to the
+        conversation. The L2 cold restart passes history=False so its documented
+        [system, digest, stage prompt] shape is preserved.
+        """
+        try:
+            signalled = sorted(self._stage_signalled_events)
+        except Exception:
+            signalled = []
+        when = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._snap_marker = {
+            "when": when,
+            "stage": str(stage_name),
+            "phase": str(phase),
+            "signalled": signalled,
+        }
+        text = ("[SNAP MARKER] %s snap at stage '%s' (%s); events already "
+                "signalled this stage: %s"
+                % (when, stage_name, phase,
+                   ", ".join(signalled) if signalled else "none"))
+        if history:
+            try:
+                self.history.append({"role": "user", "content": text})
+            except Exception:
+                pass
+        return text
 
     def _mid_loop_protection(self, stage, stage_prompt, turn):
         """High-water safety net inside a long-running stage (not Snap boundary).
@@ -3091,7 +3166,7 @@ class Agent:
 
         # Formal handler path: run it even when the stage says Snap: disabled
         # (emergency/forced because we are above the class high watermark).
-        turn = self._maybe_snap(stage, turn, force=True)
+        turn = self._maybe_snap(stage, turn, force=True, phase="mid-stage")
         rebuilt = self._last_snap_rebuilt
         if rebuilt:
             # The handler digest replaced the conversation; restore the current
@@ -3227,6 +3302,11 @@ class Agent:
             note = (f"L2 reflection + cold restart from stage '{stage.get('name', 'Stage')}'. "
                     f"~{before_tokens} -> ~{final_tokens} tokens (est.).")
             self.logger.log_compression_restart(self.history, note)
+            # SNAP MARKER: the L1/L2 cold restart is a compression too, so mark it
+            # with the same visible attribution as the handler Snap path.
+            self.logger.log_compression(
+                self._mark_snap(stage.get('name', 'Stage'), 'l2-cold-restart',
+                                history=False))
             self.ui.display_compression(self.config.name, self.agent_id,
                                         before_tokens, final_tokens, "L2", self.compress_count)
             return True, turn
