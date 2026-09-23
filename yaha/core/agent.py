@@ -1069,21 +1069,6 @@ class Agent:
         together, and the deferred signal is reported as a blocked signal so the
         runtime's deadlock diagnostic can name each one.
         """
-        if self._compressing and tool_name in ("set_event_success",
-                                               "set_event_loop",
-                                               "set_event_jump"):
-            # A compression/snap handler is a PLAIN-TEXT digest producer: its run
-            # must NEVER signal a multi-agent event. Otherwise the handler can
-            # re-emit a stage's own signal (e.g. a duplicate code_ready), which
-            # latches and desynchronises the crew gates - the reviewer reviews a
-            # stale patch and the Summary runs a round early, then the LEAD is left
-            # parked and the runtime reports a deadlock. The guard sits BEFORE the
-            # hook-engine lookup on purpose: the handler stage declares no hooks, so
-            # the engine-free path would otherwise call the tool impl and signal.
-            return ("Error: %s is not allowed inside a compression/snap handler; "
-                    "reply with a plain-text digest, not a tool call." % tool_name,
-                    None, True)
-
         engine = self._hooks(stage)
         if engine is None:
             return self._call_tool(tool_name, args), None, True
