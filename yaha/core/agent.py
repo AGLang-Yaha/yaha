@@ -63,6 +63,174 @@ _DSML_MODEL_NAMES = frozenset({"deepseek-v4-flash", "deepseek-flash"})
 _DSML_TAG = r"[|｜]{2,}DSML[|｜]{2,}"
 
 
+# --- model-response hardening -------------------------------------------------
+# A model must never write the framework observation envelope: only the
+# framework reports tool output (see the result message built in run()). These
+# detectors are keyed on the framework OWN shape, so ordinary prose that merely
+# mentions a result is never rejected.
+_TOOL_TAG = 'tool' + '_' + 'code'
+_TOOL_BLOCK_START_PATTERNS = (
+    '<' + _TOOL_TAG + '>',
+    '<' + _DSML_TAG + _TOOL_TAG + '>',
+    '<[|｜]{2,}' + _TOOL_TAG + '>',
+)
+_TOOL_BLOCK_END_PATTERNS = (
+    '</' + _TOOL_TAG + '>',
+    '</' + _DSML_TAG + _TOOL_TAG + '>',
+    '</[|｜]{2,}' + _TOOL_TAG + '>',
+    _DSML_TAG + _TOOL_TAG + '>',
+    '[|｜]{2,}' + _TOOL_TAG + '>',
+    '</' + 'tool' + '_cod' + '[^>]*>',
+)
+
+# The framework own envelope fields: both must appear before a body counts as an
+# envelope, so a lone Status line in prose is never enough.
+_OBSERVATION_HEADER_RE = re.compile(r'^\s*TOOL RESULT\b', re.IGNORECASE | re.MULTILINE)
+_OBSERVATION_TAG_RE = re.compile(r'</?\s*tool[_-]?result\b[^>]*>', re.IGNORECASE)
+_OBSERVATION_FIELD_RES = (
+    re.compile(r'^\s*[-*]\s*\*\*Status\*\*\s*:', re.MULTILINE),
+    re.compile(r'^\s*[-*]\s*\*\*Output Size\*\*\s*:', re.MULTILINE),
+)
+# What the framework itself writes into history, including the compressed form
+# that _truncate_old_tool_results produces; either counts as a real observation.
+_TOOL_RESULT_PREFIXES = ('TOOL RESULT (', 'COMPRESSED TOOL RESULT (')
+
+_FABRICATED_OBSERVATION_ERROR = (
+    'Malformed response: the reply writes the framework observation envelope '
+    '(a fabricated tool result). Only the framework reports tool output - make '
+    'the call you need instead of inventing its result.'
+)
+_UNGROUNDED_CLAIM_ERROR = (
+    'Malformed response: the reply claims a verified outcome, but this agent has '
+    'not run anything yet, so the claim cannot be grounded. Run the command (or '
+    'drop the claim) before answering.'
+)
+# Outcome claims that only a real observation could support. Deliberately narrow:
+# it never fires unless the agent also holds no observation at all.
+_VERIFIED_CLAIM_RE = re.compile(
+    r'\b(?:'
+    r'the tests? (?:all )?(?:passed|pass|succeeded)'
+    r'|all \d+ tests? pass(?:ed)?'
+    r'|the (?:command|suite|gate|build|run) (?:succeeded|passed|failed)'
+    r'|i (?:have )?(?:read|opened|checked|inspected) the file'
+    r'|the file (?:now )?contains'
+    r'|i (?:have )?(?:ran|executed) the (?:command|tests?|suite|script)'
+    r'|the gate is green'
+    r')',
+    re.IGNORECASE,
+)
+
+
+def _strip_reasoning(text):
+    '''Return text without its reasoning section (same rules as the parser).'''
+    if '<reasoning>' not in text:
+        return text
+    if '</reasoning>' not in text:
+        return text.split('<reasoning>', 1)[0]
+    return re.sub(r'<reasoning>.*?</reasoning>', '', text, flags=re.DOTALL)
+
+
+def _strip_tool_blocks(text):
+    '''Return text with any tool block removed.
+
+    Quoting the envelope inside a call argument (a plan, a README, a test
+    fixture) is legitimate work, so only text OUTSIDE a block is judged.
+    '''
+    starts = []
+    for p in _TOOL_BLOCK_START_PATTERNS:
+        starts.extend(re.finditer(p, text, re.IGNORECASE))
+    if not starts:
+        return text
+    first = min(starts, key=lambda m: m.start())
+    tail = text[first.end():]
+    last_end = None
+    for m in re.finditer('|'.join(_TOOL_BLOCK_END_PATTERNS), tail, re.IGNORECASE):
+        last_end = m
+    if last_end is None:
+        return text[:first.start()]
+    return text[:first.start()] + tail[last_end.end():]
+
+
+def _looks_like_fabricated_observation(text):
+    '''True when a model wrote the framework observation envelope itself.'''
+    if not text:
+        return False
+    if _OBSERVATION_HEADER_RE.search(text):
+        return True
+    if _OBSERVATION_TAG_RE.search(text):
+        return True
+    return all(r.search(text) for r in _OBSERVATION_FIELD_RES)
+
+
+def _parse_tool_block(text, end_patterns):
+    '''Return (call_or_None, last_error_or_None) for the block at text.
+
+    Candidate ends are tried longest-first: that ordering is what lets a nested
+    close tag inside a JSON string argument parse correctly.
+    '''
+    ends = []
+    for p in end_patterns:
+        for m in re.finditer(p, text, re.IGNORECASE):
+            ends.append(m.start())
+    ends.append(len(text))
+    last_err = None
+    for end_pos in sorted(set(ends), reverse=True):
+        code_block = text[:end_pos].strip()
+        if not code_block:
+            continue
+        try:
+            parsed = json_repair.loads(code_block)
+        except Exception as e:
+            last_err = str(e)
+            continue
+        if isinstance(parsed, dict) and 'tool' in parsed:
+            return parsed, None
+    return None, last_err
+
+
+def _distinct_tool_calls(text, starts, end_patterns):
+    '''Return the distinct calls carried by the given start positions.
+
+    Each block is cut at its own first end marker, so two different calls in one
+    reply cannot collapse into the same (last) parse.
+    '''
+    distinct = []
+    for start in starts:
+        tail = text[start:]
+        cut = len(tail)
+        for p in end_patterns:
+            m = re.search(p, tail, re.IGNORECASE)
+            if m and m.start() < cut:
+                cut = m.start()
+        try:
+            parsed = json_repair.loads(tail[:cut].strip())
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and 'tool' in parsed and parsed not in distinct:
+            distinct.append(parsed)
+    return distinct
+
+
+def _validate_tool_call_shape(parsed):
+    '''Return (call, error) enforcing the documented call shapes.
+
+    A non-string name used to pass the parser and then die on a set-membership
+    test in run() (unhashable type), killing the whole run.
+    '''
+    tool_name = parsed.get('tool')
+    if not isinstance(tool_name, str) or not tool_name.strip():
+        got = 'nothing' if tool_name is None else type(tool_name).__name__
+        return None, ('Malformed tool call: the `tool` key must be a non-empty '
+                      'string naming the tool to run, got %s. Re-emit the call with '
+                      'a `tool` string and an `args` object.' % got)
+    if 'args' in parsed:
+        stray = sorted(k for k in parsed if k not in ('tool', 'args'))
+        if stray:
+            return None, ('Malformed tool call: unexpected key(s) %s beside `args`. '
+                          'Use exactly one `tool` key plus an `args` object, or the '
+                          'inlined shape with the arguments as siblings of `tool`.'
+                          % ', '.join(repr(k) for k in stray))
+    return parsed, None
 def _parse_dsml_invoke(text):
     """Parse the FIRST DeepSeek DSML tool invoke into {"tool", "args"}.
 
@@ -1276,10 +1444,14 @@ class Agent:
         """Check for <tool_code> format and handle potential malformations."""
         # Patterns for start and end of tool code blocks, including DSML and hallucinated variations
         # We catch standard tags, and common leaks like <｜｜DSML｜｜tool_code> or ｜｜tool_code>
-        start_patterns = [r"<tool_code>", r"<[|｜]{2,}DSML[|｜]{2,}tool_code>", r"<[|｜]{2,}tool_code>"]
-        end_patterns = [r"</tool_code>", r"</[|｜]{2,}DSML[|｜]{2,}tool_code>", r"</[|｜]{2,}tool_code>", 
-                        r"[|｜]{2,}DSML[|｜]{2,}tool_code>", r"[|｜]{2,}tool_code>", r"</tool_cod[^>]*>"]
+        start_patterns = list(_TOOL_BLOCK_START_PATTERNS)
+        end_patterns = list(_TOOL_BLOCK_END_PATTERNS)
         
+        if not isinstance(response, str) or not response.strip():
+            got = type(response).__name__ if not isinstance(response, str) else 'an empty reply'
+            return None, (
+                'Malformed response: expected a non-empty string reply, got %s.' % got)
+
         # Robustly handle reasoning section - identify what's inside and outside
         content_outside_reasoning = response
         if "<reasoning>" in response:
@@ -1288,6 +1460,11 @@ class Agent:
             else:
                 # Unclosed tag, treat everything after as reasoning
                 content_outside_reasoning = response.split("<reasoning>", 1)[0]
+
+        # A fabricated observation must never leave the model: only the framework
+        # writes the envelope; text inside a call block is judged separately.
+        if _looks_like_fabricated_observation(_strip_tool_blocks(content_outside_reasoning)):
+            return None, _FABRICATED_OBSERVATION_ERROR
 
         # Find all potential tool block starts in content_outside_reasoning
         all_starts = []
@@ -1298,39 +1475,22 @@ class Agent:
         if all_starts:
             # Prioritize the last occurrence to be robust against redundant leading tags
             start_idx = sorted(all_starts)[-1]
+            starts = sorted(set(all_starts))
+            if len(starts) > 1:
+                distinct = _distinct_tool_calls(content_outside_reasoning, starts, end_patterns)
+                if len(distinct) > 1:
+                    return None, (
+                        'Malformed tool call: this reply carries %d different tool calls. '
+                        'Emit exactly ONE call per turn so the framework cannot act on the '
+                        'wrong one.' % len(distinct))
+
             remaining_content = content_outside_reasoning[start_idx:]
             
-            # Find all candidate end positions relative to start_idx
-            candidate_ends = []
-            for p in end_patterns:
-                for m in re.finditer(p, remaining_content, re.IGNORECASE):
-                    candidate_ends.append(m.start())
-            
-            # Add the end of the string as a fallback candidate
-            candidate_ends.append(len(remaining_content))
-            
-            # Sort candidate end indices in descending order (longest slice first)
-            candidate_ends = sorted(list(set(candidate_ends)), reverse=True)
-            
-            parsed_tool = None
-            last_err = None
-            
-            # Sequentially validate each candidate slice to find the correct structured JSON object
-            for end_pos in candidate_ends:
-                code_block = remaining_content[:end_pos].strip()
-                if not code_block:
-                    continue
-                try:
-                    parsed = json_repair.loads(code_block)
-                    if isinstance(parsed, dict) and "tool" in parsed:
-                        parsed_tool = parsed
-                        break # Found valid structured JSON call!
-                except Exception as e:
-                    last_err = str(e)
-            
+            parsed_tool, last_err = _parse_tool_block(remaining_content, end_patterns)
+
             if parsed_tool is not None:
-                return parsed_tool, None
-                
+                return _validate_tool_call_shape(parsed_tool)
+
             return None, f"Malformed tool block: The content inside the tool block is not a valid JSON object with a 'tool' key. Error: {last_err or 'invalid JSON structure'}"
         
         # If we reached here, no valid tool call was found using patterns.
@@ -1343,7 +1503,7 @@ class Agent:
              if getattr(self, '_dsml_accommodate', False):
                  dsml_tool = _parse_dsml_invoke(content_outside_reasoning)
                  if dsml_tool is not None:
-                     return dsml_tool, None
+                     return _validate_tool_call_shape(dsml_tool)
              return None, "Malformed tool call: You used internal reasoning markers (like DSML or ｜｜) outside the reasoning block. Please use exactly <tool_code>...</tool_code> for tool calls."
 
         # Check for mismatched tags (only if has_end but no has_start, which is rare but possible)
@@ -1362,6 +1522,32 @@ class Agent:
              return None, "Malformed response: Your output contains only reasoning. Please provide a tool call or a final answer outside the <reasoning> block."
 
         return None, None 
+
+    def _observation_error(self, response, check_claims=False):
+        '''Return an error when the reply fabricates an observation.
+
+        The envelope check is format-based. The claim check only applies where a
+        turn may end as a final answer, and only fires when the agent has never
+        received a real observation - otherwise a legitimate wrap-up that
+        mentions earlier results would be rejected.
+        '''
+        prose = ''
+        if isinstance(response, str):
+            prose = _strip_tool_blocks(_strip_reasoning(response))
+        if _looks_like_fabricated_observation(prose):
+            return _FABRICATED_OBSERVATION_ERROR
+        if (check_claims and _VERIFIED_CLAIM_RE.search(prose)
+                and not self._has_real_observation()):
+            return _UNGROUNDED_CLAIM_ERROR
+        return None
+
+    def _has_real_observation(self):
+        '''True when the history already holds a framework observation envelope.'''
+        for msg in getattr(self, 'history', None) or []:
+            content = msg.get('content') if isinstance(msg, dict) else None
+            if isinstance(content, str) and content.startswith(_TOOL_RESULT_PREFIXES):
+                return True
+        return False
 
     def restart_impl(self):
         if self.restart_count < ChainBudget.RESTART_CAP:
@@ -2292,6 +2478,7 @@ class Agent:
         fail_target = self._stage_failure_target(stage)
         tools_called = set()
         stage_turn = 0
+        claim_bounces = 0
 
         # If allowed_tools is specified, ensure required and exit tools are callable.
         effective_allowed = None
@@ -2354,7 +2541,10 @@ class Agent:
                     self._record_usage(usage)
                 
                 # API-level failure: provider returned an error string / no usable text.
-                api_error = (not response or not response.strip() or response.startswith("Error calling "))
+                api_error = (
+                    not isinstance(response, str)
+                    or not response.strip()
+                    or response.startswith("Error calling "))
                 if api_error:
                     last_failure_hint = str(response or "API call returned an empty response").strip()
                     # Silent recovery log: this failure is absorbed by a retry.
@@ -2371,13 +2561,15 @@ class Agent:
                     
                     # One-pass optimization: no tools -> plain text is the final answer.
                     if not self.config.toolset:
-                        self.history.append({"role": "assistant", "content": response})
-                        self.ui.display_final_answer(self.config.name, self.agent_id, response)
-                        return response, "DONE", turn + 1
-                    
-                    tool_call, validation_error = self.validate_response(response)
-                    if not validation_error:
-                        break
+                        validation_error = self._observation_error(response)
+                        if validation_error is None:
+                            self.history.append({"role": "assistant", "content": response})
+                            self.ui.display_final_answer(self.config.name, self.agent_id, response)
+                            return response, "DONE", turn + 1
+                    else:
+                        tool_call, validation_error = self.validate_response(response)
+                        if not validation_error:
+                            break
                     last_failure_hint = str(validation_error).strip()
                     # Silent recovery log: a malformed response is retried too.
                     self.log_error(
@@ -2460,6 +2652,25 @@ class Agent:
                     error_msg = f"Error: Stage '{stage_name}' requires an exit tool ({', '.join(sorted(exit_tools))}) to complete. You have just output a pure text response. You can continue work or call one of them to end."
                     self.history.append({"role": "user", "content": error_msg})
                     self.ui.display_error(self.config.name, self.agent_id, error_msg)
+                    turn += 1
+                    continue
+
+                if self._has_real_observation():
+                    # A real observation resets the counter: only CONSECUTIVE
+                    # ungrounded claims are bounded.
+                    claim_bounces = 0
+                observation_error = self._observation_error(response, check_claims=True)
+                if observation_error is not None:
+                    error_msg = 'Error: ' + observation_error
+                    self.history.append({"role": "user", "content": error_msg})
+                    self.ui.display_error(self.config.name, self.agent_id, error_msg)
+                    claim_bounces += 1
+                    if claim_bounces >= self.llm_retry_limit:
+                        error_msg = ('Error: the model kept claiming a verified outcome '
+                                     'without any observation after %d attempts.' % claim_bounces)
+                        self.history.append({"role": "user", "content": error_msg})
+                        self.ui.display_error(self.config.name, self.agent_id, error_msg)
+                        return error_msg, "ERROR", turn
                     turn += 1
                     continue
 

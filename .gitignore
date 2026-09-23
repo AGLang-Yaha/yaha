@@ -63,3 +63,5 @@ test_package/
 test_upgrade/
 test_issue44/
 ws1/
+# Crew scratch (round artefacts, never committed)
+tmp/
