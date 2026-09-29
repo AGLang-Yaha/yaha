@@ -46,6 +46,8 @@ import time
 from collections import deque
 
 from .endpoints import (ENDPOINT_IDLE_TIMEOUT_S, EndpointRegistry, is_ep)
+from .async_jobs import (AsyncJobRegistry, JOB_IDLE_TIMEOUT_S,
+                        is_async_job)
 
 # --- agent lifecycle states -------------------------------------------------
 
@@ -201,7 +203,8 @@ class AgentRuntime:
     the handles parked on it; ``pool`` tracks every live handle by name.
     """
 
-    def __init__(self, ui=None, endpoint_idle_timeout=ENDPOINT_IDLE_TIMEOUT_S):
+    def __init__(self, ui=None, endpoint_idle_timeout=ENDPOINT_IDLE_TIMEOUT_S,
+                 job_idle_timeout=JOB_IDLE_TIMEOUT_S):
         self.ui = ui
         self.events = EventRegistry()
         # ENDPOINT WAKE MAILBOX. With endpoints a wake arrives from an HTTP
@@ -225,6 +228,20 @@ class AgentRuntime:
         # the same conversations. `wake` lets an arriving message release an
         # agent parked on that endpoint.
         self.endpoints = EndpointRegistry(wake=self._notify_endpoint)
+        # ASYNC JOB WAKE MAILBOX. A background job finishes on its WORKER
+        # thread, so - exactly like an endpoint wake - it must NEVER touch
+        # the scheduler state (`waiting` / `ready`) directly. The worker
+        # posts the job id here and sets the Event; the scheduler drains it
+        # on its own thread and turns it into `set_event(job_id)`, releasing
+        # any agent parked on that id. `async_jobs` is run-global, like the
+        # endpoints and the bindings.
+        self._job_lock = threading.Lock()
+        self._job_pending = deque()
+        self._job_event = threading.Event()
+        self._job_activity = time.monotonic()
+        # Bounded: a job that never answers must end the run LOUDLY.
+        self.job_idle_timeout = float(job_idle_timeout)
+        self.async_jobs = AsyncJobRegistry(wake=self._notify_job)
         self.ready = deque()
         self.waiting = {}
         self.pool = {}
@@ -376,6 +393,52 @@ class AgentRuntime:
                 return True
         return False
 
+    def _notify_job(self, name):
+        """Thread-safe: queue an async job wake for the scheduler thread.
+
+        Called from the WORKER thread the instant a job finishes, so it must
+        NOT touch `self.waiting` or `self.ready`. It records the job id and
+        sets the Event; the scheduler's own loop drains it and turns it into
+        `set_event`. A durable queue (not a momentary flag) means a wake that
+        lands in the take-then-park window cannot be lost.
+        """
+        with self._job_lock:
+            self._job_pending.append(str(name))
+        self._job_event.set()
+        return 1
+
+    def _drain_job_notifications(self):
+        """Turn queued job wakes into ready handles (scheduler thread).
+
+        Unlike an endpoint (a level signal read with `_wake`), a job id is a
+        REAL event name, so it goes through `set_event`: parked waiters are
+        released, the pulse is re-armed when consumed, and it latches when the
+        job finished before anyone parked - the documented event semantics.
+        """
+        with self._job_lock:
+            pending = list(self._job_pending)
+            self._job_pending.clear()
+        if not pending:
+            return 0
+        self._job_event.clear()
+        self._job_activity = time.monotonic()
+        for name in pending:
+            self.set_event(name)
+        return len(pending)
+
+    def _job_wait_live(self):
+        """True while a parked async-job wait could still be answered.
+
+        A job's producer is a WORKER THREAD, not a handle in the pool, so
+        "nothing is runnable" does not mean "no progress is possible" for a
+        wait on a LIVE job id. The scheduler consults this only for job-id
+        names, so local waits keep the original deadlock semantics exactly.
+        """
+        for name in list(self.waiting):
+            if is_async_job(name) and self.async_jobs.is_live(name):
+                return True
+        return False
+
     def _wake(self, name):
         """Release every live agent parked on ``name``; return how many."""
         waiters = self.waiting.pop(name, None)
@@ -422,6 +485,7 @@ class AgentRuntime:
             # Endpoint wakes arrive from foreign threads; turn them into ready
             # handles HERE, on the scheduler thread, before deciding anything.
             self._drain_endpoint_notifications()
+            self._drain_job_notifications()
             if not self.ready:
                 if self._endpoint_wait_live():
                     # An endpoint's producer is an EXTERNAL peer, so "nothing is
@@ -438,8 +502,28 @@ class AgentRuntime:
                                       ", ".join(sorted(self.waiting))))
                         self._abort_pool()
                         self.endpoints.reclaim()
+                        self.async_jobs.shutdown()
                         raise RuntimeDeadlockError(message)
                     self._endpoint_event.wait(0.05)
+                    continue
+                if self._job_wait_live():
+                    # A job producer is a WORKER THREAD, so "nothing is
+                    # runnable" is NOT "no progress is possible": wait for
+                    # job activity instead of declaring a deadlock. The
+                    # bounded idle timeout keeps this honest when a job
+                    # never answers, so the detector is delayed, not disabled.
+                    if (time.monotonic() - self._job_activity
+                            > self.job_idle_timeout):
+                        message = ("Multi-agency deadlock: no agent is runnable "
+                                   "and no async job answered within %gs. "
+                                   "Waiting on: %s"
+                                   % (self.job_idle_timeout,
+                                      ", ".join(sorted(self.waiting))))
+                        self._abort_pool()
+                        self.endpoints.reclaim()
+                        self.async_jobs.shutdown()
+                        raise RuntimeDeadlockError(message)
+                    self._job_event.wait(0.05)
                     continue
                 # Build the diagnostic FIRST: it describes the agents that are
                 # still parked, and reaping the pool renames every one of them
@@ -453,12 +537,14 @@ class AgentRuntime:
                 # Close every listener/poller too: an aborted run must not leak
                 # a bound port into a long-lived process.
                 self.endpoints.reclaim()
+                self.async_jobs.shutdown()
                 raise RuntimeDeadlockError(message)
             handle = self.ready.popleft()
             self._step(handle)
         # The run is over: reclaim every conversation and listener (`close_tool`
         # is a courtesy for the peer, never a requirement for us).
         self.endpoints.reclaim()
+        self.async_jobs.shutdown()
         if root_handle is not None:
             return root_handle.result
         return None
@@ -492,6 +578,12 @@ class AgentRuntime:
                 # waits; `_endpoint_wait_live` decides whether we may keep
                 # waiting at all.
                 self._endpoint_activity = time.monotonic()
+            elif is_async_job(name) and self.async_jobs.is_live(name):
+                # A fresh JOB wait gets a FULL idle budget measured from HERE,
+                # not from construction or the last job completion, so a
+                # healthy job parked on late in a long-lived run is never
+                # aborted early by the idle-timeout deadlock guard.
+                self._job_activity = time.monotonic()
         elif kind == "enter":
             stage_name = token[1]
             handle.entered.append(stage_name)
@@ -737,6 +829,11 @@ def validate_wait_events(agent_classes):
             # inbound connect, a CEP by its conversation. Neither is a
             # `set_event_*` prompt literal, so the local producer rule cannot
             # apply to it.
+            continue
+        if is_async_job(name):
+            # An async job PRODUCES its own event when it finishes (the
+            # runtime sets the job id), so a wait on it has no `set_event_*`
+            # prompt literal either - the same exemption an endpoint gets.
             continue
         if late_binding_possible:
             continue

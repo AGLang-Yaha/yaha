@@ -12,12 +12,14 @@ import yaml
 from .logger import AgentLogger
 from ..tools.file_tools import create_file, read_file, edit_file, write_file, search_files, grep_files, append_file, list_files
 from ..tools.system_tools import bash_tool, web_fetch_tool, tavily_search_tool
+from ..tools.async_tools import async_bash_tool, poll_async_tool
 from ..tools.skill_tools import load_skill
 from ..ui.terminal import YAHAUI, ASK_INTERRUPT_SENTINEL
 from . import interrupt_commands as ic
 from .chain import ChainBudget, ChainWalk, StageExit
 from .context_calibration import ContextCalibration
 from .runtime import RuntimeDeadlockError, is_placeholder
+from .async_jobs import AsyncJobRegistry, DONE
 from .endpoints import MAX_CONSECUTIVE_ERRORS, EndpointError, is_ep
 from collections import namedtuple
 
@@ -422,6 +424,11 @@ class Agent:
         # Explicit unattended mode. None means infer from stdin TTY later.
         self.unattended = unattended
         
+        # Background async jobs (`async_bash`): inside a multi-agency run the
+        # run-global `runtime.async_jobs` is used (see `_async_registry`);
+        # this local registry serves a single-agent run instead.
+        self._async_jobs_local = None
+
         # Initialize Tool Map with Access Control
         self.tool_map = {
             "create_file": lambda path, content: create_file(path, content, access_controller=self.access_controller, ui=self.ui),
@@ -436,6 +443,9 @@ class Agent:
             "append_file": lambda path, content: append_file(path, content, access_controller=self.access_controller, ui=self.ui),
             "list_files": lambda path=".", pattern=None: list_files(path, pattern, access_controller=self.access_controller, ui=self.ui),
             "bash_tool": self._bash_tool_with_guard,
+            "async_bash": self._async_bash_tool_with_guard,
+            "poll_async": lambda job_id: poll_async_tool(
+                job_id, registry=self._async_registry()),
             "web_fetch_tool": web_fetch_tool,
             "load_skill": lambda name: load_skill(name, session=self.session),
             "yaha_spawn_agent": lambda **kwargs: self.yaha_spawn_agent(**kwargs),
@@ -1100,6 +1110,15 @@ class Agent:
                 engine.close()
             except Exception:
                 pass
+        # A LOCAL async-job registry (single-agent run) can hold live Popen
+        # children; kill them so a long-lived process (the ChatAgent loop)
+        # cannot leak a child when a nested run is aborted.
+        local = self._async_jobs_local
+        if local is not None:
+            try:
+                local.shutdown()
+            except Exception:
+                pass
 
     def _hook_observation(self, label, text, turn):
         """Inject a (capture) hook's output into the conversation.
@@ -1343,6 +1362,53 @@ class Agent:
             self.ui, self._interrupt_suspend, self._interrupt_resume
         )
 
+    def _async_registry(self):
+        """The async job registry this agent should use.
+
+        Inside a multi-agency run the registry is run-global (owned by the
+        runtime, exactly like the endpoints and the bindings), so a job
+        started by one agent and a stage parked on its id share one map. A
+        single-agent run has no runtime, so the agent keeps its own registry:
+        the jobs still run and are still delivered, only a cross-agent
+        wait-by-id cannot be satisfied (nothing could set that event).
+        """
+        runtime = self.runtime
+        registry = getattr(runtime, "async_jobs", None) if runtime is not None else None
+        if registry is not None:
+            return registry
+        if self._async_jobs_local is None:
+            self._async_jobs_local = AsyncJobRegistry()
+        return self._async_jobs_local
+
+    def _drain_async_results(self):
+        """Attach every finished, undelivered async job result to history.
+
+        Called once per turn, right before the LLM request, so a background
+        command that finished while the agent kept working is delivered on
+        the next message instead of waiting for an explicit `poll_async`.
+        Returns the number of results attached.
+        """
+        registry = self._async_registry()
+        if registry is None:
+            return 0
+        finished = registry.drain_finished(owner=self.agent_id)
+        for job in finished:
+            status = "SUCCESS" if job.status == DONE else "ERROR"
+            body = job.output or "(no output)"
+            if job.error:
+                body = body + chr(10) + "ERROR: " + job.error
+            result_msg = ("ASYNC BASH RESULT (" + job.job_id + "):" + chr(10)
+                          + "- **Status**: " + status + chr(10)
+                          + "- **Content**:" + chr(10) + "```" + chr(10)
+                          + body + chr(10) + "```")
+            self.history.append({"role": "user", "content": result_msg})
+            try:
+                self.ui.display_tool_result(
+                    self.config.name, self.agent_id, "async_bash", body)
+            except Exception:
+                pass
+        return len(finished)
+
     def _bash_tool_with_guard(self, cmdline):
         """Run bash_tool with a guarded UI for its security question.
 
@@ -1361,6 +1427,27 @@ class Agent:
             agent_id=self.agent_id,
             ui=self._interrupt_guarded_ui(),
             max_output_bytes=self._tool_output_budget(),
+        )
+
+    def _async_bash_tool_with_guard(self, cmdline):
+        """Run async_bash_tool with a guarded UI for its security question.
+
+        Exactly mirrors ``_bash_tool_with_guard``: the AccessController asks
+        its permission question (agent id 'ACS') through this UI, and the
+        guarded proxy suspends the Esc listener during the prompt so the
+        operator's first keystroke is NOT stolen by the active cbreak reader.
+        The registry, agent id and output budget are resolved lazily here, at
+        call time, and the job is owner-tagged so its result drains back to
+        THIS agent only.
+        """
+        return async_bash_tool(
+            cmdline,
+            registry=self._async_registry(),
+            access_controller=self.access_controller,
+            agent_id=self.agent_id,
+            ui=self._interrupt_guarded_ui(),
+            max_output_bytes=self._tool_output_budget(),
+            owner=self.agent_id,
         )
 
     def ask_user(self, question):
@@ -2528,6 +2615,11 @@ class Agent:
                 if restarted:
                     tools_called = set()
                     stage_turn = 0
+
+            # Deliver every background (async_bash) result that finished
+            # since the last turn, so the model sees it on the message it is
+            # about to receive instead of having to poll.
+            self._drain_async_results()
 
             # Call LLM; a full round of failures asks the user to wait or break.
             retry_count = 0

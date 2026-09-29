@@ -180,6 +180,34 @@
     }
   },
   {
+    "name": "async_bash",
+    "description": "Launch a shell command in the BACKGROUND and return immediately with a waitable job id. Use it for long-running commands so work can continue in parallel. The id (async-N) is a waitable EVENT name (declare it as a stage Wait Event, or bind a @placeholder to it); check progress with poll_async; the finished result is also attached automatically to your next message.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "cmdline": {
+          "type": "string",
+          "description": "The shell command to execute in the background."
+        }
+      },
+      "required": ["cmdline"]
+    }
+  },
+  {
+    "name": "poll_async",
+    "description": "Check the status or result of a background async_bash job by its id, without blocking.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "string",
+          "description": "The job id returned by async_bash, e.g. async-1."
+        }
+      },
+      "required": ["job_id"]
+    }
+  },
+  {
     "name": "web_fetch_tool",
     "description": "Fetches and cleans content from a URL.",
     "parameters": {

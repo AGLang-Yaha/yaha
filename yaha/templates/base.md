@@ -102,6 +102,8 @@
 	- append_file
 	- list_files
 	- bash_tool
+	- async_bash
+	- poll_async
 	- web_fetch_tool
 	- google_search_tool
 	- tavily_search_tool

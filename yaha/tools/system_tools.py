@@ -8,6 +8,22 @@ from bs4 import BeautifulSoup
 
 from .output_guard import guard_output
 
+def format_shell_output(stdout, stderr, max_output_bytes=None):
+    """Join a command's stdout/stderr the way a tool result expects.
+
+    stdout comes FIRST, then an ``Error Output:`` section for stderr; empty
+    output is reported explicitly so the model never sees a blank observation.
+    The combined text goes through the caller's byte budget last, so the cap is
+    applied to both streams together (they reach the model as ONE result).
+    """
+    output = stdout or ""
+    if stderr:
+        output += "\nError Output:\n" + stderr
+    if not output:
+        return "(empty output)"
+    return guard_output(output, max_output_bytes)
+
+
 def bash_tool(cmdline, access_controller=None, agent_id="Unknown", ui=None,
               max_output_bytes=None):
     """Run a shell command, capped to the caller's remaining-context budget.
@@ -31,14 +47,7 @@ def bash_tool(cmdline, access_controller=None, agent_id="Unknown", ui=None,
             cmdline, shell=True, capture_output=True, text=True, timeout=300
         )
         
-        output = result.stdout
-        if result.stderr:
-            output += "\nError Output:\n" + result.stderr
-        
-        if not output:
-            return "(empty output)"
-            
-        return guard_output(output, max_output_bytes)
+        return format_shell_output(result.stdout, result.stderr, max_output_bytes)
     except subprocess.TimeoutExpired:
         return "Error: Command timed out after 300 seconds."
     except Exception as e:
