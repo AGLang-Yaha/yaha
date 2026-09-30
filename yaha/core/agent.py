@@ -1422,8 +1422,14 @@ class Agent:
             body = job.output or "(no output)"
             if job.error:
                 body = body + chr(10) + "ERROR: " + job.error
+            # Echo the command AS THE AGENT WROTE IT: the result arrives after
+            # the async_bash call that launched it, and compression may have
+            # dropped that call in the meantime. It stays OUTSIDE the fenced
+            # body below, so a command containing fences cannot break it.
+            command = job.display_cmdline or job.cmdline
             result_msg = ("ASYNC BASH RESULT (" + job.job_id + "):" + chr(10)
                           + "- **Status**: " + status + chr(10)
+                          + "- **Command**: " + command + chr(10)
                           + "- **Content**:" + chr(10) + "```" + chr(10)
                           + body + chr(10) + "```")
             self.history.append({"role": "user", "content": result_msg})
