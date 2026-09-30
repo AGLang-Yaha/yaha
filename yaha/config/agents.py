@@ -53,7 +53,8 @@ class AgentClassConfig:
                  inherit_prompt=False, inherit_tools=False, inherit_skills=False, inherit_agents=False,
                  skillset_mode=None, description="", max_turns=100, max_loops=-1,
                  snap_handler=None, snap_threshold=None, snap_to=None, detached_stages=None,
-                 hook_timeout=300):
+                 hook_timeout=300,
+                 compression_keep_steps=None):
         self.name = name
         self.code = code
         self.model = model
@@ -75,6 +76,15 @@ class AgentClassConfig:
         self.snap_handler = snap_handler
         self.snap_threshold = float(snap_threshold) if snap_threshold is not None else None
         self.snap_to = float(snap_to) if snap_to is not None else None
+        # How many recent ReAct steps a context compression keeps (agent-wide).
+        # None means "not authored here" so a parent class's value can inherit.
+        if compression_keep_steps is None:
+            self.compression_keep_steps = None
+        else:
+            try:
+                self.compression_keep_steps = max(0, int(compression_keep_steps))
+            except (TypeError, ValueError):
+                self.compression_keep_steps = None
         self.detached_stages = dict(detached_stages or {})
         # Stage-hook policy: per-block timeout in seconds for bash and python
         # hooks (0 disables the timeout). None means "not authored here" so the
@@ -222,6 +232,8 @@ def _parse_class_sections(content):
         snap_threshold = _ratio(snap_threshold_match.group(1)) if snap_threshold_match else None
         snap_to_match = re.search(r'^- \*\*Snap To:\*\*\s*(.+)', section_text, re.MULTILINE)
         snap_to = _ratio(snap_to_match.group(1)) if snap_to_match else None
+        keep_steps_match = re.search(r'^- \*\*Compression Keep Steps:\*\*\s*(\d+)', section_text, re.MULTILINE)
+        compression_keep_steps = int(keep_steps_match.group(1)) if keep_steps_match else None
 
         hook_timeout_match = re.search(r'^- \*\*Hook Timeout:\*\*\s*(-?[\d.]+)',
                                        section_text, re.MULTILINE)
@@ -447,6 +459,7 @@ def _parse_class_sections(content):
             skillset_mode=skillset_mode, description=description,
             max_turns=max_turns, max_loops=max_loops,
             snap_handler=snap_handler, snap_threshold=snap_threshold, snap_to=snap_to,
+            compression_keep_steps=compression_keep_steps,
             hook_timeout=hook_timeout
         )))
 
@@ -658,6 +671,8 @@ def _resolve_classes(agent_classes):
                     config.snap_threshold = parent.snap_threshold
                 if config.snap_to is None:
                     config.snap_to = parent.snap_to
+                if config.compression_keep_steps is None:
+                    config.compression_keep_steps = parent.compression_keep_steps
                 if config.skillset_mode is None:
                     config.skillset_mode = parent.skillset_mode
                 if config.hook_timeout is None:

@@ -340,6 +340,30 @@ Hooks inherit exactly like the other stage fields, and the rule is uniform:
 So a subclass can extend a parent's hooks by adding the marker, and can take a
 field over completely by simply authoring it.
 
+Context compression
+-------------------
+
+Long-horizon runs compress their context in one of two ways: a class-level Snap
+policy (`Snap Handler` / `Snap Threshold` / `Snap To`) whose detached handler
+produces the summary, or the built-in L2 reflection when no handler exists. Both
+rebuild the context from three parts, in order:
+
+1. the freshly built system prompt (the MEMORY INDEX is re-read),
+2. a compact summary of the prior conversation (asked to fit in fewer than 100
+   lines, hard-capped at 100), with sections GOAL / KEY LEARNINGS / DESIGN &
+   ARCHITECTURE DECISIONS / PENDING / KEY FILES / ERRORS & LESSONS,
+3. the most recent ReAct steps - a step is one tool_call-result pair.
+
+`Compression Keep Steps` sets how many recent ReAct steps survive a compression
+(the default is 10). It is a class-level scalar and inherits like the other Snap
+fields:
+
+      - **Compression Keep Steps:** 10
+
+The retained steps are NOT exempt from the L1 rule: an oversized TOOL RESULT
+inside the retained window is still replaced by the standard compressed
+placeholder.
+
 Where classes come from
 -----------------------
 

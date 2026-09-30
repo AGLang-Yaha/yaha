@@ -57,6 +57,18 @@ HARD_FORCE_FLOOR = 0.5
 # (`self.config.max_tokens or 4096` in llm/deepseek.py).
 HARD_FORCE_DEFAULT_MAX_TOKENS = 4096
 
+# Context-compression retention policy (L2 cold restart AND the Snap handler).
+#
+# A compressed context is rebuilt as: system prompt + a compact summary + the
+# *last n ReAct steps*, so the agent resumes with concrete recent work instead of
+# only a digest. `COMPRESSION_KEEP_STEPS` is the DEFAULT n; an agent class overrides
+# it with the class-level AgentClass key `Compression Keep Steps`.
+COMPRESSION_KEEP_STEPS = 10
+
+# The summary that replaces the earlier conversation is asked to fit in FEWER THAN
+# this many lines, and is hard-capped here at runtime as a safety net.
+COMPRESSION_SUMMARY_MAX_LINES = 100
+
 # DeepSeek flash models sometimes bypass the harness <tool_code> format and
 # emit their native DSML tool-call block instead. Accommodate that dialect for
 # exactly these model names (checked together with provider == "deepseek").
@@ -392,6 +404,9 @@ class Agent:
         self._stage_peak_ratio = 0.0
         self._calibration = ContextCalibration()
         self._compressing = False
+        # The prompt of the stage currently running, so a venue /compress can
+        # re-inject it after forcing a mid-stage compression.
+        self._current_stage_prompt = ''
         self._last_snap_rebuilt = False
         # User-interrupt (Esc) state. The engine owns the shared stdin/Esc
         # controller (installed for interactive root runs, dormant otherwise);
@@ -725,32 +740,42 @@ class Agent:
         prompt += "- Inherited (spawns a sub-agent of your own class)\n\n"
 
         # Inject Memory Index
-        memory_dir = os.path.join(self.session.workspace_dir, ".yaha", "memory")
-        if os.path.exists(memory_dir):
-            memory_files = []
-            for f in sorted(os.listdir(memory_dir)):
-                if f.endswith(".md"):
-                    file_path = os.path.join(memory_dir, f)
-                    desc = "No description available."
-                    try:
-                        with open(file_path, "r", encoding="utf-8") as file:
-                            content = file.read()
-                            if content.startswith("---"):
-                                parts = content.split("---", 2)
-                                if len(parts) >= 3:
-                                    frontmatter = yaml.safe_load(parts[1])
-                                    if isinstance(frontmatter, dict):
-                                        desc = frontmatter.get("description", desc)
-                    except:
-                        pass
-                    memory_files.append(f"- {f}\n  - Description: {desc}")
-            
-            if memory_files:
-                prompt += "MEMORY INDEX:\n"
-                prompt += "The following files are available in your memory folder. You can read them using `read_file` if you need more context on specific topics.\n"
-                prompt += "\n".join(memory_files) + "\n\n"
-        
+        memory_files = self._memory_index_entries()
+        if memory_files:
+            prompt += "MEMORY INDEX:\n"
+            prompt += "The following files are available in your memory folder. You can read them using `read_file` if you need more context on specific topics.\n"
+            prompt += "\n".join(memory_files) + "\n\n"
+
         return prompt
+
+    def _memory_index_entries(self):
+        """The name/description lines of the memory folder index.
+
+        Shared by build_system_prompt (the MEMORY INDEX section) and the venue
+        /memory command, so the operator sees exactly what the agent was given.
+        """
+        memory_dir = os.path.join(self.session.workspace_dir, ".yaha", "memory")
+        entries = []
+        if not os.path.exists(memory_dir):
+            return entries
+        for f in sorted(os.listdir(memory_dir)):
+            if not f.endswith(".md"):
+                continue
+            file_path = os.path.join(memory_dir, f)
+            desc = "No description available."
+            try:
+                with open(file_path, "r", encoding="utf-8") as file:
+                    content = file.read()
+                    if content.startswith("---"):
+                        parts = content.split("---", 2)
+                        if len(parts) >= 3:
+                            frontmatter = yaml.safe_load(parts[1])
+                            if isinstance(frontmatter, dict):
+                                desc = frontmatter.get("description", desc)
+            except Exception:
+                pass
+            entries.append(f"- {f}\n  - Description: {desc}")
+        return entries
 
     def yaha_spawn_agent(self, system, instruction, agent_class=None):
         # Implementation of RAC
@@ -2398,6 +2423,158 @@ class Agent:
             return
         self.ui.interrupt_answer(self.config.name, self.agent_id, digest)
 
+    # --- venue inspection helpers (read-only, model-free) -------------------
+
+    def _venue_history_page(self, page, page_size):
+        """Render one page of the venue history browser.
+
+        Returns (text, page, pages). Pages are ordered oldest -> newest.
+        """
+        total = len(self.history)
+        try:
+            page_size = max(1, min(100, int(page_size)))
+        except (TypeError, ValueError):
+            page_size = 10
+        if total == 0:
+            return ('history: 0 messages' + chr(10) + 'nav: q=quit', 1, 1)
+        pages = (total + page_size - 1) // page_size
+        page = max(1, min(int(page), pages))
+        start = (page - 1) * page_size
+        end = min(total, start + page_size)
+        lines = ['history: %d messages  (page %d/%d)  showing [%d-%d]'
+                 % (total, page, pages, start, end - 1)]
+        for idx in range(start, end):
+            msg = self.history[idx]
+            role = str(msg.get('role') or '?')
+            body = str(msg.get('content') or '').replace(chr(10), ' ').strip()
+            if len(body) > 100:
+                body = body[:97] + '...'
+            lines.append('  [%d] %s: %s' % (idx, role.ljust(9), body))
+        lines.append('nav: n=next page  p=prev page  g <page>  d <idx>=detail  q=quit')
+        return (chr(10).join(lines), page, pages)
+
+    def _venue_history_browser(self, arg):
+        """Interactive, read-only history pager for the venue /history command."""
+        name = self.config.name
+        agent_id = self.agent_id
+        page_size = 10
+        if arg:
+            try:
+                page_size = int(str(arg).strip())
+            except (TypeError, ValueError):
+                page_size = 10
+        page_size = max(1, min(100, page_size))
+        total = len(self.history)
+        page = ((total + page_size - 1) // page_size) if total else 1
+        while True:
+            text, page, pages = self._venue_history_page(page, page_size)
+            self.ui.interrupt_info(name, agent_id, 'Interrupt History', text)
+            raw = self.ui.interrupt_read('history> ')
+            if raw is None:
+                return
+            key = str(raw).strip()
+            if key == '':
+                key = 'n'
+            low = key.lower()
+            if low in ('q', 'quit', 'exit'):
+                return
+            if low in ('n', 'next'):
+                if page >= pages:
+                    self.ui.display_warning(name, agent_id, 'Already at the newest page.')
+                else:
+                    page += 1
+                continue
+            if low in ('p', 'prev', 'previous'):
+                if page <= 1:
+                    self.ui.display_warning(name, agent_id, 'Already at the oldest page.')
+                else:
+                    page -= 1
+                continue
+            parts = key.split(None, 1)
+            verb = parts[0].lower()
+            operand = parts[1].strip() if len(parts) > 1 else ''
+            if verb == 'g':
+                try:
+                    target = int(operand)
+                except (TypeError, ValueError):
+                    self.ui.display_warning(name, agent_id, 'Usage: g <page>')
+                    continue
+                if target < 1 or target > pages:
+                    self.ui.display_warning(
+                        name, agent_id, 'Page %d is out of range 1..%d.' % (target, pages))
+                page = max(1, min(target, pages))
+                continue
+            if verb == 'd':
+                try:
+                    idx = int(operand)
+                except (TypeError, ValueError):
+                    self.ui.display_warning(name, agent_id, 'Usage: d <idx>')
+                    continue
+                if idx < 0 or idx >= len(self.history):
+                    self.ui.display_warning(name, agent_id, 'No message at index %d.' % idx)
+                    continue
+                msg = self.history[idx]
+                role = str(msg.get('role') or '?')
+                self.ui.interrupt_info(
+                    name, agent_id, 'Interrupt History [%d] %s' % (idx, role),
+                    str(msg.get('content') or ''))
+                continue
+            self.ui.display_warning(
+                name, agent_id,
+                "Unknown history key '%s'. Use n, p, g <page>, d <idx>, or q." % key)
+
+    def _venue_memory_report(self):
+        """The memory-index view for the venue /memory command."""
+        try:
+            entries = self._memory_index_entries()
+        except Exception:
+            entries = []
+        session = getattr(self, 'session', None)
+        workspace = str(getattr(session, 'workspace_dir', '') or '').strip()
+        if workspace:
+            folder = os.path.join(workspace, '.yaha', 'memory')
+        else:
+            folder = os.path.join('.yaha', 'memory')
+        lines = ['memory folder: ' + folder]
+        if entries:
+            lines.append('files: %d' % len(entries))
+            lines.extend(entries)
+        else:
+            lines.append('files: 0 (the memory folder is empty or missing)')
+        return chr(10).join(lines)
+
+    def _venue_chain_report(self, stage):
+        """The prompt-chain view for the venue /chain command."""
+        chain = list(getattr(self.config, 'prompt_chain', []) or [])
+        idx = getattr(self, '_chain_index', 0) or 0
+        detached = sorted((getattr(self.config, 'detached_stages', {}) or {}).keys())
+        pos = (idx + 1) if chain else 0
+        lines = ['chain: %d stage(s)  position %d/%d' % (len(chain), pos, len(chain))]
+        for j, s in enumerate(chain):
+            marker = '  <-' if j == idx else ''
+            lines.append('  %d. %s%s' % (j + 1, s.get('name', 'Stage'), marker))
+        lines.append('detached: ' + (', '.join(detached) if detached else 'none'))
+        return chr(10).join(lines)
+
+    def _venue_compress(self, stage):
+        """Force an immediate context compression and report the outcome."""
+        name = self.config.name
+        agent_id = self.agent_id
+        before = int(self._context_usage_ratio() * self.context_size)
+        before_count = self.compress_count
+        stage_prompt = getattr(self, '_current_stage_prompt', '') or ''
+        try:
+            rebuilt, _ = self._mid_loop_protection(
+                stage or {}, stage_prompt, self._current_turn, force=True)
+        except Exception as exc:
+            self.ui.display_warning(name, agent_id, 'compression failed: %s' % exc)
+            return
+        after = int(self._context_usage_ratio() * self.context_size)
+        report = ('compress: ~%d -> ~%d tokens (est.), delta ~%d, rebuilt=%s, count %d -> %d'
+                  % (before, after, before - after, bool(rebuilt),
+                     before_count, self.compress_count))
+        self.ui.interrupt_info(name, agent_id, 'Interrupt Compress', report)
+
     def _venue_spawn(self, arg):
         """Spawn a sub-agent from the venue and show its output."""
         agent_class, _, task_text = str(arg).partition(' ')
@@ -2469,6 +2646,21 @@ class Agent:
                 if spec.name == 'spawn':
                     self._venue_spawn(arg)
                     continue
+                if spec.name == 'history':
+                    self._venue_history_browser(arg)
+                    continue
+                if spec.name == 'memory':
+                    self.ui.interrupt_info(name, agent_id, 'Interrupt Memory',
+                                           self._venue_memory_report())
+                    continue
+                if spec.name == 'chain':
+                    self.ui.interrupt_info(name, agent_id, 'Interrupt Chain',
+                                           self._venue_chain_report(stage))
+                    continue
+                if spec.name == 'compress':
+                    self._venue_compress(stage)
+                    continue
+
                 if spec.name == 'resume':
                     self.ui.interrupt_note(
                         name, agent_id,
@@ -2557,6 +2749,8 @@ class Agent:
         # this same loop while _compressing is set) from wiping the outer stage's peak.
         if not self._compressing:
             self._stage_peak_ratio = 0.0
+            # Remember the stage prompt so a venue /compress can re-inject it.
+            self._current_stage_prompt = stage_prompt
         required_tools = set(stage.get("required_tools", []) or [])
         exit_tools = set(stage.get("exit_tools", []) or [])
         allowed_tools = set(stage.get("allowed_tools", []) or [])
@@ -3286,8 +3480,13 @@ class Agent:
                      + f"\n\n[SNAP REQUEST] Context usage is {ratio * 100:.0f}% "
                      + f"(target after snap: ~{target * 100:.0f}%). "
                      + f"Stage '{stage_name}' just completed. Persist durable "
-                     + "facts/memory if needed, then reply with a concise "
-                     + "plain-text digest; it will replace the prior conversation.")
+                     + "facts/memory if needed, then reply with a plain-text summary of "
+                     + f"the conversation in FEWER THAN {COMPRESSION_SUMMARY_MAX_LINES} "
+                     + "LINES (aim for well under), using sections: GOAL, KEY LEARNINGS, "
+                     + "DESIGN & ARCHITECTURE DECISIONS (most important), PENDING, "
+                     + "KEY FILES, ERRORS & LESSONS. The summary replaces the prior "
+                     + "conversation; the most recent ReAct steps are kept after it "
+                     + "(subject to the L1 truncation rule).")
 
         original_history = list(self.history)
         original_turn = turn
@@ -3305,14 +3504,11 @@ class Agent:
                 return original_turn
 
             # Cold restart: rebuild system prompt so the MEMORY INDEX is
-            # refreshed with any files the handler wrote during reflection.
-            self.history = [
-                {"role": "system", "content": self.build_system_prompt()},
-                {"role": "user", "content": (
-                    "CONTEXT DIGEST (the earlier conversation was compressed; full details "
-                    "remain in the log file and the memory folder):\n\n" + digest.strip()
-                )},
-            ]
+            # refreshed with any files the handler wrote during reflection, then
+            # append the most recent ReAct steps (the L1 rule still applies).
+            steps = self._recent_react_steps(self._compression_keep_steps(),
+                                             history=original_history)
+            self._rebuild_compressed_history(digest, steps=steps)
             self._last_snap_rebuilt = True
             final_tokens = int(self._context_usage_ratio() * self.context_size)
             self.compress_count += 1
@@ -3377,7 +3573,7 @@ class Agent:
                 pass
         return text
 
-    def _mid_loop_protection(self, stage, stage_prompt, turn):
+    def _mid_loop_protection(self, stage, stage_prompt, turn, force=False):
         """High-water safety net inside a long-running stage (not Snap boundary).
 
         This is the STRICT net: it fires at HARD_FORCE_RATIO and it fires regardless of
@@ -3400,7 +3596,7 @@ class Agent:
         # from this model's window (see _hard_force_ratio) so the net can always fit its own
         # request. Below it, compressing is the opt-in stage Snap's business, not this net's.
         bar = self._hard_force_ratio()
-        if self._compressing or ratio < bar:
+        if self._compressing or (not force and ratio < bar):
             return False, turn
         before_tokens = int(ratio * self.context_size)
 
@@ -3467,6 +3663,85 @@ class Agent:
             return True, turn
         return False, turn
 
+    def _compression_keep_steps(self):
+        """How many recent ReAct steps a compression keeps (n).
+
+        An agent-wide parameter: the class-level AgentClass key
+        `Compression Keep Steps` when authored, else COMPRESSION_KEEP_STEPS.
+        """
+        value = getattr(self.config, "compression_keep_steps", None)
+        if value is None:
+            return COMPRESSION_KEEP_STEPS
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return COMPRESSION_KEEP_STEPS
+        return max(0, value)
+
+    def _recent_react_steps(self, n, history=None):
+        """The last `n` ReAct steps (tool_call-result pairs) of a history.
+
+        A step ends at a `TOOL RESULT (...)` user message and starts at the nearest
+        preceding assistant message that carried the call. This is structural, not
+        content-parsing, so DSML / tool_code dialects behave identically. Returns the
+        messages in chronological order.
+        """
+        if not n or n <= 0:
+            return []
+        hist = self.history if history is None else history
+        ends = [i for i, m in enumerate(hist)
+                if m.get("role") == "user"
+                and (m.get("content") or "").startswith(_TOOL_RESULT_PREFIXES)]
+        if not ends:
+            return []
+        steps = []
+        lower = 0
+        for end in ends[-n:]:
+            start = end
+            for j in range(end - 1, lower - 1, -1):
+                if hist[j].get("role") == "assistant":
+                    start = j
+                    break
+            steps.extend(hist[start:end + 1])
+            lower = end + 1
+        return steps
+
+    def _cap_summary_lines(self, text, max_lines=COMPRESSION_SUMMARY_MAX_LINES):
+        """Hard-cap a compression summary strictly below `max_lines` lines.
+
+        The prompts ask for FEWER THAN `max_lines` lines, so the cap keeps at
+        most `max_lines - 1` lines and appends a one-line truncation note.
+        """
+        lines = (text or "").splitlines()
+        if len(lines) < max_lines:
+            return text
+        keep = max_lines - 1
+        return ("\n".join(lines[:keep])
+                + "\n[... summary truncated to %d lines ...]" % keep)
+
+    def _rebuild_compressed_history(self, summary, steps=None):
+        """Build a compressed context: system prompt + summary + last ReAct steps.
+
+        The L1 truncation rule still applies to the retained steps, so an oversized
+        TOOL RESULT inside the window is replaced by the standard placeholder here
+        exactly as it would be in the live history.
+        """
+        if steps is None:
+            steps = self._recent_react_steps(self._compression_keep_steps())
+        self.history = [
+            {"role": "system", "content": self.build_system_prompt()},
+            {"role": "user", "content": (
+                "CONTEXT DIGEST (the earlier conversation was compressed; full details "
+                "remain in the log file and the memory folder):\n\n"
+                + self._cap_summary_lines(summary).strip()
+            )},
+        ]
+        for msg in steps:
+            self.history.append(dict(msg))
+        # The L1 rule still governs the retained steps.
+        self._truncate_old_tool_results()
+        return self.history
+
     def _truncate_old_tool_results(self, keep_last=6, head_chars=500):
         """L1: replace old tool result messages with a truncated placeholder,
         in place (history length is preserved for incremental logging)."""
@@ -3505,13 +3780,18 @@ class Agent:
             "Before replying, you MAY update your memory folder (.yaha/memory/) with any durable "
             "facts, decisions, or lessons worth keeping across the compression (use write_file/append_file/edit_file). "
             "Keep memory updates small and precise.\n\n"
-            "Then produce a structured digest of the conversation so far, with EXACTLY these sections:\n"
-            "GOAL: what you are trying to accomplish.\n"
-            "COMPLETED: what has been done so far (concise bullets).\n"
+            "Then produce a COMPACT summary of the ENTIRE conversation so far in FEWER THAN "
+            f"{COMPRESSION_SUMMARY_MAX_LINES} LINES (aim for well under {COMPRESSION_SUMMARY_MAX_LINES}). "
+            "It will replace the earlier conversation, so keep only what is needed to continue.\n"
+            "Use EXACTLY these sections:\n"
+            "GOAL: the project/task goal and what you are trying to accomplish.\n"
+            "KEY LEARNINGS: the durable lessons from the work so far.\n"
+            "DESIGN & ARCHITECTURE DECISIONS: the important design/architecture choices that "
+            "have been made and why (MOST IMPORTANT - do not omit this section).\n"
             "PENDING: what remains to be done, including the immediate next step.\n"
             "KEY FILES: important files/paths touched or needed, with one-line notes.\n"
             "ERRORS & LESSONS: failures encountered and how they were resolved (if any).\n\n"
-            "Your final plain-text reply (no tool call) is taken as the digest."
+            "Your final plain-text reply (no tool call) is taken as the summary."
         )
         reflection_stage = {
             "name": "Compression",
@@ -3544,6 +3824,11 @@ class Agent:
             compressed_n = self._truncate_old_tool_results()
             after_l1 = self._context_usage_ratio()
             after_l1_tokens = int(after_l1 * self.context_size)
+            # The most recent ReAct steps survive the L2 cold restart (the L1 rule
+            # still applies to them; see _rebuild_compressed_history). Captured
+            # BEFORE the reflection loop, so the reflection's own tool results are
+            # never mistaken for steps.
+            steps = self._recent_react_steps(self._compression_keep_steps())
 
             if self._l1_sufficient(after_l1, target):
                 self.compress_count += 1
@@ -3569,21 +3854,15 @@ class Agent:
                                             before_tokens, after_l1_tokens, "L1 (L2 failed)", self.compress_count)
                 return False, turn
 
-            # Cold restart: rebuild history. build_system_prompt() re-reads the
-            # memory folder, so the memory index (frontmatter) is reloaded and
-            # picks up any updates made during reflection.
-            self.history = [
-                {"role": "system", "content": self.build_system_prompt()},
-                {"role": "user", "content": (
-                    "CONTEXT DIGEST (the earlier conversation was compressed; full details "
-                    "remain in the log file and the memory folder):\n\n" + digest
-                )},
-                {"role": "user", "content": (
-                    stage_prompt +
-                    "\n\n[CONTEXT RESTORED] The context above is a compressed digest of earlier "
-                    "work. Continue this stage from where it left off."
-                )},
-            ]
+            # Cold restart: build the compressed context (system prompt + summary
+            # + the most recent ReAct steps; the L1 rule still applies to them),
+            # then re-inject this stage's prompt so the loop can continue.
+            self._rebuild_compressed_history(digest, steps=steps)
+            self.history.append({"role": "user", "content": (
+                stage_prompt +
+                "\n\n[CONTEXT RESTORED] The context above is a compressed digest of earlier "
+                "work. Continue this stage from where it left off."
+            )})
             final_tokens = int(self._context_usage_ratio() * self.context_size)
             self.compress_count += 1
             self._usage_is_predicted = True
