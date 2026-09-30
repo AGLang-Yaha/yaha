@@ -57,6 +57,18 @@ HARD_FORCE_FLOOR = 0.5
 # (`self.config.max_tokens or 4096` in llm/deepseek.py).
 HARD_FORCE_DEFAULT_MAX_TOKENS = 4096
 
+# Context-compression retention policy (L2 cold restart AND the Snap handler).
+#
+# A compressed context is rebuilt as: system prompt + a compact summary + the
+# *last n ReAct steps*, so the agent resumes with concrete recent work instead of
+# only a digest. `COMPRESSION_KEEP_STEPS` is the DEFAULT n; an agent class overrides
+# it with the class-level AgentClass key `Compression Keep Steps`.
+COMPRESSION_KEEP_STEPS = 10
+
+# The summary that replaces the earlier conversation is asked to fit in FEWER THAN
+# this many lines, and is hard-capped here at runtime as a safety net.
+COMPRESSION_SUMMARY_MAX_LINES = 100
+
 # DeepSeek flash models sometimes bypass the harness <tool_code> format and
 # emit their native DSML tool-call block instead. Accommodate that dialect for
 # exactly these model names (checked together with provider == "deepseek").
@@ -3286,8 +3298,13 @@ class Agent:
                      + f"\n\n[SNAP REQUEST] Context usage is {ratio * 100:.0f}% "
                      + f"(target after snap: ~{target * 100:.0f}%). "
                      + f"Stage '{stage_name}' just completed. Persist durable "
-                     + "facts/memory if needed, then reply with a concise "
-                     + "plain-text digest; it will replace the prior conversation.")
+                     + "facts/memory if needed, then reply with a plain-text summary of "
+                     + f"the conversation in FEWER THAN {COMPRESSION_SUMMARY_MAX_LINES} "
+                     + "LINES (aim for well under), using sections: GOAL, KEY LEARNINGS, "
+                     + "DESIGN & ARCHITECTURE DECISIONS (most important), PENDING, "
+                     + "KEY FILES, ERRORS & LESSONS. The summary replaces the prior "
+                     + "conversation; the most recent ReAct steps are kept after it "
+                     + "(subject to the L1 truncation rule).")
 
         original_history = list(self.history)
         original_turn = turn
@@ -3305,14 +3322,11 @@ class Agent:
                 return original_turn
 
             # Cold restart: rebuild system prompt so the MEMORY INDEX is
-            # refreshed with any files the handler wrote during reflection.
-            self.history = [
-                {"role": "system", "content": self.build_system_prompt()},
-                {"role": "user", "content": (
-                    "CONTEXT DIGEST (the earlier conversation was compressed; full details "
-                    "remain in the log file and the memory folder):\n\n" + digest.strip()
-                )},
-            ]
+            # refreshed with any files the handler wrote during reflection, then
+            # append the most recent ReAct steps (the L1 rule still applies).
+            steps = self._recent_react_steps(self._compression_keep_steps(),
+                                             history=original_history)
+            self._rebuild_compressed_history(digest, steps=steps)
             self._last_snap_rebuilt = True
             final_tokens = int(self._context_usage_ratio() * self.context_size)
             self.compress_count += 1
@@ -3467,6 +3481,85 @@ class Agent:
             return True, turn
         return False, turn
 
+    def _compression_keep_steps(self):
+        """How many recent ReAct steps a compression keeps (n).
+
+        An agent-wide parameter: the class-level AgentClass key
+        `Compression Keep Steps` when authored, else COMPRESSION_KEEP_STEPS.
+        """
+        value = getattr(self.config, "compression_keep_steps", None)
+        if value is None:
+            return COMPRESSION_KEEP_STEPS
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return COMPRESSION_KEEP_STEPS
+        return max(0, value)
+
+    def _recent_react_steps(self, n, history=None):
+        """The last `n` ReAct steps (tool_call-result pairs) of a history.
+
+        A step ends at a `TOOL RESULT (...)` user message and starts at the nearest
+        preceding assistant message that carried the call. This is structural, not
+        content-parsing, so DSML / tool_code dialects behave identically. Returns the
+        messages in chronological order.
+        """
+        if not n or n <= 0:
+            return []
+        hist = self.history if history is None else history
+        ends = [i for i, m in enumerate(hist)
+                if m.get("role") == "user"
+                and (m.get("content") or "").startswith(_TOOL_RESULT_PREFIXES)]
+        if not ends:
+            return []
+        steps = []
+        lower = 0
+        for end in ends[-n:]:
+            start = end
+            for j in range(end - 1, lower - 1, -1):
+                if hist[j].get("role") == "assistant":
+                    start = j
+                    break
+            steps.extend(hist[start:end + 1])
+            lower = end + 1
+        return steps
+
+    def _cap_summary_lines(self, text, max_lines=COMPRESSION_SUMMARY_MAX_LINES):
+        """Hard-cap a compression summary strictly below `max_lines` lines.
+
+        The prompts ask for FEWER THAN `max_lines` lines, so the cap keeps at
+        most `max_lines - 1` lines and appends a one-line truncation note.
+        """
+        lines = (text or "").splitlines()
+        if len(lines) < max_lines:
+            return text
+        keep = max_lines - 1
+        return ("\n".join(lines[:keep])
+                + "\n[... summary truncated to %d lines ...]" % keep)
+
+    def _rebuild_compressed_history(self, summary, steps=None):
+        """Build a compressed context: system prompt + summary + last ReAct steps.
+
+        The L1 truncation rule still applies to the retained steps, so an oversized
+        TOOL RESULT inside the window is replaced by the standard placeholder here
+        exactly as it would be in the live history.
+        """
+        if steps is None:
+            steps = self._recent_react_steps(self._compression_keep_steps())
+        self.history = [
+            {"role": "system", "content": self.build_system_prompt()},
+            {"role": "user", "content": (
+                "CONTEXT DIGEST (the earlier conversation was compressed; full details "
+                "remain in the log file and the memory folder):\n\n"
+                + self._cap_summary_lines(summary).strip()
+            )},
+        ]
+        for msg in steps:
+            self.history.append(dict(msg))
+        # The L1 rule still governs the retained steps.
+        self._truncate_old_tool_results()
+        return self.history
+
     def _truncate_old_tool_results(self, keep_last=6, head_chars=500):
         """L1: replace old tool result messages with a truncated placeholder,
         in place (history length is preserved for incremental logging)."""
@@ -3505,13 +3598,18 @@ class Agent:
             "Before replying, you MAY update your memory folder (.yaha/memory/) with any durable "
             "facts, decisions, or lessons worth keeping across the compression (use write_file/append_file/edit_file). "
             "Keep memory updates small and precise.\n\n"
-            "Then produce a structured digest of the conversation so far, with EXACTLY these sections:\n"
-            "GOAL: what you are trying to accomplish.\n"
-            "COMPLETED: what has been done so far (concise bullets).\n"
+            "Then produce a COMPACT summary of the ENTIRE conversation so far in FEWER THAN "
+            f"{COMPRESSION_SUMMARY_MAX_LINES} LINES (aim for well under {COMPRESSION_SUMMARY_MAX_LINES}). "
+            "It will replace the earlier conversation, so keep only what is needed to continue.\n"
+            "Use EXACTLY these sections:\n"
+            "GOAL: the project/task goal and what you are trying to accomplish.\n"
+            "KEY LEARNINGS: the durable lessons from the work so far.\n"
+            "DESIGN & ARCHITECTURE DECISIONS: the important design/architecture choices that "
+            "have been made and why (MOST IMPORTANT - do not omit this section).\n"
             "PENDING: what remains to be done, including the immediate next step.\n"
             "KEY FILES: important files/paths touched or needed, with one-line notes.\n"
             "ERRORS & LESSONS: failures encountered and how they were resolved (if any).\n\n"
-            "Your final plain-text reply (no tool call) is taken as the digest."
+            "Your final plain-text reply (no tool call) is taken as the summary."
         )
         reflection_stage = {
             "name": "Compression",
@@ -3544,6 +3642,11 @@ class Agent:
             compressed_n = self._truncate_old_tool_results()
             after_l1 = self._context_usage_ratio()
             after_l1_tokens = int(after_l1 * self.context_size)
+            # The most recent ReAct steps survive the L2 cold restart (the L1 rule
+            # still applies to them; see _rebuild_compressed_history). Captured
+            # BEFORE the reflection loop, so the reflection's own tool results are
+            # never mistaken for steps.
+            steps = self._recent_react_steps(self._compression_keep_steps())
 
             if self._l1_sufficient(after_l1, target):
                 self.compress_count += 1
@@ -3569,21 +3672,15 @@ class Agent:
                                             before_tokens, after_l1_tokens, "L1 (L2 failed)", self.compress_count)
                 return False, turn
 
-            # Cold restart: rebuild history. build_system_prompt() re-reads the
-            # memory folder, so the memory index (frontmatter) is reloaded and
-            # picks up any updates made during reflection.
-            self.history = [
-                {"role": "system", "content": self.build_system_prompt()},
-                {"role": "user", "content": (
-                    "CONTEXT DIGEST (the earlier conversation was compressed; full details "
-                    "remain in the log file and the memory folder):\n\n" + digest
-                )},
-                {"role": "user", "content": (
-                    stage_prompt +
-                    "\n\n[CONTEXT RESTORED] The context above is a compressed digest of earlier "
-                    "work. Continue this stage from where it left off."
-                )},
-            ]
+            # Cold restart: build the compressed context (system prompt + summary
+            # + the most recent ReAct steps; the L1 rule still applies to them),
+            # then re-inject this stage's prompt so the loop can continue.
+            self._rebuild_compressed_history(digest, steps=steps)
+            self.history.append({"role": "user", "content": (
+                stage_prompt +
+                "\n\n[CONTEXT RESTORED] The context above is a compressed digest of earlier "
+                "work. Continue this stage from where it left off."
+            )})
             final_tokens = int(self._context_usage_ratio() * self.context_size)
             self.compress_count += 1
             self._usage_is_predicted = True
