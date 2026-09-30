@@ -67,11 +67,16 @@ _ARG_HINTS = {
     'call': '<detached-stage>',
     'spawn': '<AgentClass> <task>',
     'resume': '[<text>]',
+    'history': '[<page-size>]',
 }
 
 INTERRUPT_COMMANDS = (
     InterruptCommand('help', ARG_NONE, KIND_LOOP, '', 'show this command menu', ASK_LOOP),
     InterruptCommand('status', ARG_NONE, KIND_LOOP, '', 'show the live runtime state', ASK_LOOP),
+    InterruptCommand('history', ARG_OPTIONAL, KIND_LOOP, '', 'browse the conversation history', ASK_LOOP),
+    InterruptCommand('memory', ARG_NONE, KIND_LOOP, '', 'show the memory index (files and descriptions)', ASK_LOOP),
+    InterruptCommand('chain', ARG_NONE, KIND_LOOP, '', 'show the prompt chain and detached stages', ASK_LOOP),
+    InterruptCommand('compress', ARG_NONE, KIND_LOOP, '', 'force a context compression now', ASK_LOOP),
     InterruptCommand('call', ARG_REQUIRED, KIND_LOOP, '', 'run a detached stage and show its output', ASK_LOOP),
     InterruptCommand('spawn', ARG_REQUIRED, KIND_LOOP, '', 'spawn a sub-agent and show its output', ASK_LOOP),
     InterruptCommand('resume', ARG_OPTIONAL, KIND_FINAL, STATUS_RESUME, 'resume the interrupted stage (optional steer text)', ASK_ANSWER),

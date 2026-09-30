@@ -649,6 +649,12 @@ class YAHAUI:
         self.console.print(str(text))
         self.console.print()
 
+    def interrupt_info(self, agent_name, agent_id, title, text):
+        """Print a titled read-only info panel (venue /history, /memory, ...)."""
+        self._interrupt_rule(agent_name, agent_id, str(title), 'bold blue')
+        self.console.print(str(text))
+        self.console.print()
+
     def interrupt_note(self, agent_name, agent_id, text):
         """Print a plain one-line note, e.g. the /resume confirmation."""
         self.console.print(str(text))

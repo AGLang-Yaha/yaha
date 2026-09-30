@@ -404,6 +404,9 @@ class Agent:
         self._stage_peak_ratio = 0.0
         self._calibration = ContextCalibration()
         self._compressing = False
+        # The prompt of the stage currently running, so a venue /compress can
+        # re-inject it after forcing a mid-stage compression.
+        self._current_stage_prompt = ''
         self._last_snap_rebuilt = False
         # User-interrupt (Esc) state. The engine owns the shared stdin/Esc
         # controller (installed for interactive root runs, dormant otherwise);
@@ -737,32 +740,42 @@ class Agent:
         prompt += "- Inherited (spawns a sub-agent of your own class)\n\n"
 
         # Inject Memory Index
-        memory_dir = os.path.join(self.session.workspace_dir, ".yaha", "memory")
-        if os.path.exists(memory_dir):
-            memory_files = []
-            for f in sorted(os.listdir(memory_dir)):
-                if f.endswith(".md"):
-                    file_path = os.path.join(memory_dir, f)
-                    desc = "No description available."
-                    try:
-                        with open(file_path, "r", encoding="utf-8") as file:
-                            content = file.read()
-                            if content.startswith("---"):
-                                parts = content.split("---", 2)
-                                if len(parts) >= 3:
-                                    frontmatter = yaml.safe_load(parts[1])
-                                    if isinstance(frontmatter, dict):
-                                        desc = frontmatter.get("description", desc)
-                    except:
-                        pass
-                    memory_files.append(f"- {f}\n  - Description: {desc}")
-            
-            if memory_files:
-                prompt += "MEMORY INDEX:\n"
-                prompt += "The following files are available in your memory folder. You can read them using `read_file` if you need more context on specific topics.\n"
-                prompt += "\n".join(memory_files) + "\n\n"
-        
+        memory_files = self._memory_index_entries()
+        if memory_files:
+            prompt += "MEMORY INDEX:\n"
+            prompt += "The following files are available in your memory folder. You can read them using `read_file` if you need more context on specific topics.\n"
+            prompt += "\n".join(memory_files) + "\n\n"
+
         return prompt
+
+    def _memory_index_entries(self):
+        """The name/description lines of the memory folder index.
+
+        Shared by build_system_prompt (the MEMORY INDEX section) and the venue
+        /memory command, so the operator sees exactly what the agent was given.
+        """
+        memory_dir = os.path.join(self.session.workspace_dir, ".yaha", "memory")
+        entries = []
+        if not os.path.exists(memory_dir):
+            return entries
+        for f in sorted(os.listdir(memory_dir)):
+            if not f.endswith(".md"):
+                continue
+            file_path = os.path.join(memory_dir, f)
+            desc = "No description available."
+            try:
+                with open(file_path, "r", encoding="utf-8") as file:
+                    content = file.read()
+                    if content.startswith("---"):
+                        parts = content.split("---", 2)
+                        if len(parts) >= 3:
+                            frontmatter = yaml.safe_load(parts[1])
+                            if isinstance(frontmatter, dict):
+                                desc = frontmatter.get("description", desc)
+            except Exception:
+                pass
+            entries.append(f"- {f}\n  - Description: {desc}")
+        return entries
 
     def yaha_spawn_agent(self, system, instruction, agent_class=None):
         # Implementation of RAC
@@ -2410,6 +2423,158 @@ class Agent:
             return
         self.ui.interrupt_answer(self.config.name, self.agent_id, digest)
 
+    # --- venue inspection helpers (read-only, model-free) -------------------
+
+    def _venue_history_page(self, page, page_size):
+        """Render one page of the venue history browser.
+
+        Returns (text, page, pages). Pages are ordered oldest -> newest.
+        """
+        total = len(self.history)
+        try:
+            page_size = max(1, min(100, int(page_size)))
+        except (TypeError, ValueError):
+            page_size = 10
+        if total == 0:
+            return ('history: 0 messages' + chr(10) + 'nav: q=quit', 1, 1)
+        pages = (total + page_size - 1) // page_size
+        page = max(1, min(int(page), pages))
+        start = (page - 1) * page_size
+        end = min(total, start + page_size)
+        lines = ['history: %d messages  (page %d/%d)  showing [%d-%d]'
+                 % (total, page, pages, start, end - 1)]
+        for idx in range(start, end):
+            msg = self.history[idx]
+            role = str(msg.get('role') or '?')
+            body = str(msg.get('content') or '').replace(chr(10), ' ').strip()
+            if len(body) > 100:
+                body = body[:97] + '...'
+            lines.append('  [%d] %s: %s' % (idx, role.ljust(9), body))
+        lines.append('nav: n=next page  p=prev page  g <page>  d <idx>=detail  q=quit')
+        return (chr(10).join(lines), page, pages)
+
+    def _venue_history_browser(self, arg):
+        """Interactive, read-only history pager for the venue /history command."""
+        name = self.config.name
+        agent_id = self.agent_id
+        page_size = 10
+        if arg:
+            try:
+                page_size = int(str(arg).strip())
+            except (TypeError, ValueError):
+                page_size = 10
+        page_size = max(1, min(100, page_size))
+        total = len(self.history)
+        page = ((total + page_size - 1) // page_size) if total else 1
+        while True:
+            text, page, pages = self._venue_history_page(page, page_size)
+            self.ui.interrupt_info(name, agent_id, 'Interrupt History', text)
+            raw = self.ui.interrupt_read('history> ')
+            if raw is None:
+                return
+            key = str(raw).strip()
+            if key == '':
+                key = 'n'
+            low = key.lower()
+            if low in ('q', 'quit', 'exit'):
+                return
+            if low in ('n', 'next'):
+                if page >= pages:
+                    self.ui.display_warning(name, agent_id, 'Already at the newest page.')
+                else:
+                    page += 1
+                continue
+            if low in ('p', 'prev', 'previous'):
+                if page <= 1:
+                    self.ui.display_warning(name, agent_id, 'Already at the oldest page.')
+                else:
+                    page -= 1
+                continue
+            parts = key.split(None, 1)
+            verb = parts[0].lower()
+            operand = parts[1].strip() if len(parts) > 1 else ''
+            if verb == 'g':
+                try:
+                    target = int(operand)
+                except (TypeError, ValueError):
+                    self.ui.display_warning(name, agent_id, 'Usage: g <page>')
+                    continue
+                if target < 1 or target > pages:
+                    self.ui.display_warning(
+                        name, agent_id, 'Page %d is out of range 1..%d.' % (target, pages))
+                page = max(1, min(target, pages))
+                continue
+            if verb == 'd':
+                try:
+                    idx = int(operand)
+                except (TypeError, ValueError):
+                    self.ui.display_warning(name, agent_id, 'Usage: d <idx>')
+                    continue
+                if idx < 0 or idx >= len(self.history):
+                    self.ui.display_warning(name, agent_id, 'No message at index %d.' % idx)
+                    continue
+                msg = self.history[idx]
+                role = str(msg.get('role') or '?')
+                self.ui.interrupt_info(
+                    name, agent_id, 'Interrupt History [%d] %s' % (idx, role),
+                    str(msg.get('content') or ''))
+                continue
+            self.ui.display_warning(
+                name, agent_id,
+                "Unknown history key '%s'. Use n, p, g <page>, d <idx>, or q." % key)
+
+    def _venue_memory_report(self):
+        """The memory-index view for the venue /memory command."""
+        try:
+            entries = self._memory_index_entries()
+        except Exception:
+            entries = []
+        session = getattr(self, 'session', None)
+        workspace = str(getattr(session, 'workspace_dir', '') or '').strip()
+        if workspace:
+            folder = os.path.join(workspace, '.yaha', 'memory')
+        else:
+            folder = os.path.join('.yaha', 'memory')
+        lines = ['memory folder: ' + folder]
+        if entries:
+            lines.append('files: %d' % len(entries))
+            lines.extend(entries)
+        else:
+            lines.append('files: 0 (the memory folder is empty or missing)')
+        return chr(10).join(lines)
+
+    def _venue_chain_report(self, stage):
+        """The prompt-chain view for the venue /chain command."""
+        chain = list(getattr(self.config, 'prompt_chain', []) or [])
+        idx = getattr(self, '_chain_index', 0) or 0
+        detached = sorted((getattr(self.config, 'detached_stages', {}) or {}).keys())
+        pos = (idx + 1) if chain else 0
+        lines = ['chain: %d stage(s)  position %d/%d' % (len(chain), pos, len(chain))]
+        for j, s in enumerate(chain):
+            marker = '  <-' if j == idx else ''
+            lines.append('  %d. %s%s' % (j + 1, s.get('name', 'Stage'), marker))
+        lines.append('detached: ' + (', '.join(detached) if detached else 'none'))
+        return chr(10).join(lines)
+
+    def _venue_compress(self, stage):
+        """Force an immediate context compression and report the outcome."""
+        name = self.config.name
+        agent_id = self.agent_id
+        before = int(self._context_usage_ratio() * self.context_size)
+        before_count = self.compress_count
+        stage_prompt = getattr(self, '_current_stage_prompt', '') or ''
+        try:
+            rebuilt, _ = self._mid_loop_protection(
+                stage or {}, stage_prompt, self._current_turn, force=True)
+        except Exception as exc:
+            self.ui.display_warning(name, agent_id, 'compression failed: %s' % exc)
+            return
+        after = int(self._context_usage_ratio() * self.context_size)
+        report = ('compress: ~%d -> ~%d tokens (est.), delta ~%d, rebuilt=%s, count %d -> %d'
+                  % (before, after, before - after, bool(rebuilt),
+                     before_count, self.compress_count))
+        self.ui.interrupt_info(name, agent_id, 'Interrupt Compress', report)
+
     def _venue_spawn(self, arg):
         """Spawn a sub-agent from the venue and show its output."""
         agent_class, _, task_text = str(arg).partition(' ')
@@ -2481,6 +2646,21 @@ class Agent:
                 if spec.name == 'spawn':
                     self._venue_spawn(arg)
                     continue
+                if spec.name == 'history':
+                    self._venue_history_browser(arg)
+                    continue
+                if spec.name == 'memory':
+                    self.ui.interrupt_info(name, agent_id, 'Interrupt Memory',
+                                           self._venue_memory_report())
+                    continue
+                if spec.name == 'chain':
+                    self.ui.interrupt_info(name, agent_id, 'Interrupt Chain',
+                                           self._venue_chain_report(stage))
+                    continue
+                if spec.name == 'compress':
+                    self._venue_compress(stage)
+                    continue
+
                 if spec.name == 'resume':
                     self.ui.interrupt_note(
                         name, agent_id,
@@ -2569,6 +2749,8 @@ class Agent:
         # this same loop while _compressing is set) from wiping the outer stage's peak.
         if not self._compressing:
             self._stage_peak_ratio = 0.0
+            # Remember the stage prompt so a venue /compress can re-inject it.
+            self._current_stage_prompt = stage_prompt
         required_tools = set(stage.get("required_tools", []) or [])
         exit_tools = set(stage.get("exit_tools", []) or [])
         allowed_tools = set(stage.get("allowed_tools", []) or [])
@@ -3391,7 +3573,7 @@ class Agent:
                 pass
         return text
 
-    def _mid_loop_protection(self, stage, stage_prompt, turn):
+    def _mid_loop_protection(self, stage, stage_prompt, turn, force=False):
         """High-water safety net inside a long-running stage (not Snap boundary).
 
         This is the STRICT net: it fires at HARD_FORCE_RATIO and it fires regardless of
@@ -3414,7 +3596,7 @@ class Agent:
         # from this model's window (see _hard_force_ratio) so the net can always fit its own
         # request. Below it, compressing is the opt-in stage Snap's business, not this net's.
         bar = self._hard_force_ratio()
-        if self._compressing or ratio < bar:
+        if self._compressing or (not force and ratio < bar):
             return False, turn
         before_tokens = int(ratio * self.context_size)
 
