@@ -55,14 +55,22 @@ class AsyncJob:
     ``status`` walks PENDING -> RUNNING -> DONE/ERROR/CANCELLED. ``proc`` holds
     the live ``Popen`` (set by the runner) so ``shutdown`` can kill a child that
     would otherwise outlive an aborted run.
+
+    ``cmdline`` is what the worker RUNS; it may be a sandbox wrapper. The
+    separate ``display_cmdline`` is the same command AS THE CALLER WROTE IT,
+    and it is what the result the agent eventually reads echoes back - so a
+    result that outlives history compression still names its command.
     """
 
-    __slots__ = ("job_id", "cmdline", "owner", "status", "output",
-                 "error", "started_at", "finished_at", "delivered", "proc")
+    __slots__ = ("job_id", "cmdline", "display_cmdline", "owner", "status",
+                 "output", "error", "started_at", "finished_at", "delivered",
+                 "proc")
 
-    def __init__(self, job_id, cmdline, owner=None):
+    def __init__(self, job_id, cmdline, owner=None, display_cmdline=None):
         self.job_id = job_id
         self.cmdline = cmdline
+        self.display_cmdline = (display_cmdline if display_cmdline is not None
+                                else cmdline)
         self.owner = owner
         self.status = PENDING
         self.output = ""
@@ -106,6 +114,7 @@ class AsyncJob:
         return {
             "job_id": self.job_id,
             "cmdline": self.cmdline,
+            "display_cmdline": self.display_cmdline,
             "status": self.status,
             "output": self.output,
             "error": self.error,
@@ -135,28 +144,39 @@ class AsyncJobRegistry:
         self._wake = wake
         self._runner = runner
 
-    def allocate(self, cmdline, owner=None):
+    def allocate(self, cmdline, owner=None, display_cmdline=None):
         """Reserve a fresh job id and return the (not yet started) job.
 
         ``owner`` is the agent id that started the job; it is only used to
         scope the opportunistic drain, never the wait-by-id (any peer may
         park on any live job id).
+
+        ``display_cmdline`` (see ``AsyncJob``) is the caller-facing form of the
+        command, used when the result is shown back to the agent; it defaults
+        to ``cmdline``, the command that actually runs.
         """
         with self._lock:
             job_id = "%s%d" % (JOB_ID_PREFIX, next(self._counter))
-            job = AsyncJob(job_id, cmdline, owner=owner)
+            job = AsyncJob(job_id, cmdline, owner=owner,
+                           display_cmdline=display_cmdline)
             self._jobs[job_id] = job
             self._order.append(job_id)
             return job
 
-    def start(self, cmdline, runner=None, owner=None):
+    def start(self, cmdline, runner=None, owner=None, display_cmdline=None):
         """Allocate a job and launch it on a daemon worker thread.
 
         The status is flipped to RUNNING BEFORE the thread starts, so a
         scheduler that checks liveness immediately after this returns can never
         observe the job as finished-and-lost.
+
+        ``display_cmdline`` is the command AS THE CALLER WROTE IT, kept for the
+        result the agent eventually reads (see ``AsyncJob.display_cmdline``);
+        ``cmdline`` remains the command that actually runs, which may be a
+        sandbox wrapper.
         """
-        job = self.allocate(cmdline, owner=owner)
+        job = self.allocate(cmdline, owner=owner,
+                            display_cmdline=display_cmdline)
         run = runner or self._runner
         job.status = RUNNING
         job.started_at = time.monotonic()

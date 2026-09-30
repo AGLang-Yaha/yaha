@@ -63,6 +63,11 @@ def async_bash_tool(cmdline, registry, access_controller=None,
     """
     if registry is None:
         return "Error: async_bash requires a job registry."
+    # Keep the command AS THE AGENT WROTE IT. The sandbox wrapper computed
+    # below is what actually RUNS, but the result the agent eventually reads
+    # (possibly after history compression during a long run) must name the
+    # command the agent asked for.
+    display_cmdline = cmdline
     if access_controller:
         authorized, msg = access_controller.authorize_bash(agent_id, cmdline, ui=ui)
         if not authorized:
@@ -72,7 +77,8 @@ def async_bash_tool(cmdline, registry, access_controller=None,
     def runner(job):
         return _run_async_command(job, max_output_bytes)
 
-    job = registry.start(cmdline, runner=runner, owner=owner)
+    job = registry.start(cmdline, runner=runner, owner=owner,
+                        display_cmdline=display_cmdline)
     return ("ASYNC JOB STARTED: " + job.job_id + "\n"
             + "- Runs in the background; the id is a WAITABLE event name, so"
             + " a stage can declare it as its Wait Event (or bind a"
@@ -82,7 +88,13 @@ def async_bash_tool(cmdline, registry, access_controller=None,
 
 
 def poll_async_tool(job_id, registry):
-    """Non-blocking status/result read for one async job."""
+    """Non-blocking status/result read for one async job.
+
+    Every answer echoes the command the job was started with. The result may
+    arrive long after the ``async_bash`` call that launched it, and history
+    compression can drop that call in the meantime; naming the command here
+    keeps the result self-describing.
+    """
     if registry is None:
         return "Error: poll_async requires a job registry."
     snapshot = registry.poll(job_id)
@@ -90,10 +102,11 @@ def poll_async_tool(job_id, registry):
         return "Error: no async job with id " + repr(str(job_id)) + "."
     status = snapshot["status"]
     elapsed = snapshot["elapsed"]
+    command = snapshot.get("display_cmdline") or snapshot.get("cmdline") or ""
+    header = "ASYNC JOB %s: %s (%.1fs)" % (snapshot["job_id"], status, elapsed)
     if status in (PENDING, RUNNING):
-        return "ASYNC JOB %s: %s (%.1fs)" % (snapshot["job_id"], status, elapsed)
+        return header + "\nCOMMAND: " + command
     body = snapshot["output"] or "(no output)"
     if snapshot.get("error"):
         body = body + "\nERROR: " + snapshot["error"]
-    return "ASYNC JOB %s: %s (%.1fs)\n%s" % (
-        snapshot["job_id"], status, elapsed, body)
+    return header + "\nCOMMAND: " + command + "\n" + body
