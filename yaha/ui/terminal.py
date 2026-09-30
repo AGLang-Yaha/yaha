@@ -389,6 +389,10 @@ class YAHAUI:
                 summary = args.get("query", "")
             elif tool_name == "load_skill":
                 summary = args.get("name", "")
+            elif tool_name == "async_bash":
+                summary = args.get("cmdline", "")
+            elif tool_name == "poll_async":
+                summary = args.get("job_id", "")
 
             prefix = f"  {tool_name} "
             tool_line = Text(prefix, style="yellow")
