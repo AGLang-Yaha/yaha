@@ -19,6 +19,7 @@
 - **Snap Handler:** Compression
 - **Snap Threshold:** 80%
 - **Snap To:** 40%
+- **Compression Keep Steps:** 10
 - **Preamble:**
     - **Inherited:** None
     - **Final Answer:** True
@@ -35,9 +36,13 @@
     > The conversation context has crossed the configured threshold. Persist
     > any durable facts/decisions to the Memory folder (files under
     > `.yaha/memory/`), keeping updates small and precise, then produce a
-    > structured plain-text digest with sections: GOAL / COMPLETED / PENDING /
-    > KEY FILES / ERRORS & LESSONS. Your final plain-text reply (no tool call)
-    > is used as the compressed context.
+    > COMPACT plain-text summary of the conversation in FEWER THAN 100 LINES
+    > (aim for well under) with sections: GOAL / KEY LEARNINGS / DESIGN &
+    > ARCHITECTURE DECISIONS (most important) / PENDING / KEY FILES /
+    > ERRORS & LESSONS. The summary replaces the prior conversation, and the
+    > most recent ReAct steps are kept after it (subject to the L1 truncation
+    > rule). Your final plain-text reply (no tool call) is used as the
+    > compressed context.
 - **Aftermath:**
     - **Inherited:** None
 - **System Prompt:**

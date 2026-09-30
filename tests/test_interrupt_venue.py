@@ -98,7 +98,7 @@ def _make_agent(lines, llm=None, stage=None):
     agent._interrupt_resume = lambda: None
     agent.llm = llm or _ScriptedLLM(['a model answer'])
     box = list(lines)
-    printed = {'answers': [], 'help': [], 'status': [], 'notes': [], 'warnings': []}
+    printed = {'answers': [], 'help': [], 'status': [], 'notes': [], 'warnings': [], 'info': []}
     agent.ui = types.SimpleNamespace(
         interrupt_banner=lambda *a, **k: None,
         interrupt_read=lambda *a, **k: (box.pop(0) if box else None),
@@ -106,6 +106,7 @@ def _make_agent(lines, llm=None, stage=None):
         interrupt_help=lambda *a, **k: printed['help'].append(a[-1]),
         interrupt_status=lambda *a, **k: printed['status'].append(a[-1]),
         interrupt_note=lambda *a, **k: printed['notes'].append(a[-1]),
+        interrupt_info=lambda *a, **k: printed['info'].append(a[-1]),
         display_warning=lambda *a, **k: printed['warnings'].append(a[-1]),
         spinner=lambda *a, **k: contextlib.nullcontext(),
     )
@@ -467,6 +468,142 @@ class InterruptVenueTests(unittest.TestCase):
     test_unknown_slash_does_not_call_model = staticmethod(test_unknown_slash_does_not_call_model)
     test_eof_resumes = staticmethod(test_eof_resumes)
     test_boundary_poll_drains_pending_interrupt = staticmethod(test_boundary_poll_drains_pending_interrupt)
+
+
+class InterruptDebugCommandsTests(unittest.TestCase):
+    '''New read-only venue commands: /history browser, /memory, /chain, /compress.'''
+
+    def _history(self, n):
+        history = [{'role': 'system', 'content': 'sys'}]
+        for i in range(n):
+            history.append({'role': 'user', 'content': 'm%d' % i})
+        return history
+
+    def test_history_opens_pager_and_quits(self):
+        agent = _make_agent(['/history', 'q', '/resume'])
+        agent.history = self._history(4)
+        before = list(agent.history)
+        result = _run_venue(agent)
+        self.assertEqual(result.status, ic.STATUS_RESUME)
+        self.assertTrue(agent._printed['info'])
+        self.assertIn('history:', agent._printed['info'][0])
+        self.assertEqual(agent.llm.calls, [])
+        self.assertEqual(agent.history, before)
+
+    def test_history_header_and_indices(self):
+        agent = _make_agent(['/history', 'q', '/resume'])
+        agent.history = self._history(24)
+        _run_venue(agent)
+        text = agent._printed['info'][0]
+        self.assertIn('25 messages', text)
+        self.assertIn('[24]', text)
+
+    def test_history_page_navigation(self):
+        agent = _make_agent(['/history 5', 'p', 'p', 'q', '/resume'])
+        agent.history = self._history(24)
+        _run_venue(agent)
+        pages = [t.split('page ')[1].split('/')[0]
+                 for t in agent._printed['info'] if 'page ' in t]
+        self.assertEqual(pages, ['5', '4', '3'])
+
+    def test_history_goto_page_and_clamp(self):
+        agent = _make_agent(['/history 5', 'g 1', 'g 999', 'q', '/resume'])
+        agent.history = self._history(24)
+        _run_venue(agent)
+        pages = [t.split('page ')[1].split('/')[0]
+                 for t in agent._printed['info'] if 'page ' in t]
+        self.assertEqual(pages, ['5', '1', '5'])
+        self.assertTrue(agent._printed['warnings'])
+
+    def test_history_detail_expands_one_message(self):
+        long_text = 'X' * 500
+        agent = _make_agent(['/history', 'd 0', 'q', '/resume'])
+        agent.history = [{'role': 'system', 'content': long_text}]
+        _run_venue(agent)
+        self.assertTrue([t for t in agent._printed['info'] if long_text in t])
+
+    def test_history_bad_page_size_falls_back(self):
+        agent = _make_agent(['/history abc', 'q', '/resume'])
+        agent.history = self._history(25)
+        _run_venue(agent)
+        self.assertTrue(agent._printed['info'])
+
+    def test_history_empty_history(self):
+        agent = _make_agent(['/history', 'q', '/resume'])
+        agent.history = []
+        _run_venue(agent)
+        self.assertIn('0 messages', agent._printed['info'][0])
+
+    def test_history_unknown_key_warns_and_repages(self):
+        agent = _make_agent(['/history', 'zzz', 'q', '/resume'])
+        agent.history = self._history(4)
+        _run_venue(agent)
+        self.assertTrue(agent._printed['warnings'])
+
+    def test_memory_command_lists_index(self):
+        agent = _make_agent(['/memory', '/resume'])
+        agent._memory_index_entries = lambda: ['- notes.md' + chr(10) + '  - Description: venue memory note']
+        agent.session = types.SimpleNamespace(workspace_dir='/tmp/ws')
+        _run_venue(agent)
+        text = agent._printed['info'][0]
+        self.assertIn('notes.md', text)
+        self.assertIn('venue memory note', text)
+
+    def test_chain_command_lists_stages(self):
+        agent = _make_agent(['/chain', '/resume'])
+        agent.config.prompt_chain = [{'name': 'Preamble'}, {'name': 'Coding'}]
+        agent.config.detached_stages = {'Compression': {'content': 'x'}}
+        agent._chain_index = 1
+        _run_venue(agent)
+        text = agent._printed['info'][0]
+        self.assertIn('Preamble', text)
+        self.assertIn('Coding', text)
+        self.assertIn('position 2/2', text)
+        self.assertIn('Compression', text)
+
+    def test_compress_dispatches_forcing_mid_loop(self):
+        agent = _make_agent(['/compress', '/resume'])
+        calls = []
+        agent._mid_loop_protection = lambda stage, prompt, turn, force=False: (
+            calls.append((stage, prompt, turn, force)), (False, turn))[1]
+        _run_venue(agent, stage={'name': 'Coding'})
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0][3])
+        self.assertTrue(any('compress:' in t for t in agent._printed['info']))
+
+    def test_force_bypasses_the_watermark(self):
+        agent = _make_agent(['/resume'])
+        agent.history = [{'role': 'system', 'content': 'sys'},
+                         {'role': 'assistant', 'content': 'a'},
+                         {'role': 'user', 'content': 'b'}]
+        agent.config.snap_handler = 'Compression'
+        agent.config.detached_stages = {'Compression': {'content': 'x'}}
+        calls = []
+        agent._truncate_old_tool_results = lambda *a, **k: (calls.append(True), 0)[1]
+        agent._last_prompt_tokens = 1
+        agent._chars_at_last_usage = 1
+        agent._mid_loop_protection({'name': 'Coding'}, 'p', 1, force=False)
+        self.assertEqual(calls, [])
+        agent._mid_loop_protection({'name': 'Coding'}, 'p', 1, force=True)
+        self.assertEqual(calls, [True])
+
+    def test_table_lists_new_commands(self):
+        names = [c.name for c in ic.INTERRUPT_COMMANDS]
+        for n in ('history', 'memory', 'chain', 'compress'):
+            self.assertIn(n, names)
+        menu = ic.render_help()
+        for n in ('history', 'memory', 'chain', 'compress'):
+            self.assertIn('/' + n, menu)
+
+    def test_new_commands_are_read_only_loop_commands(self):
+        history = [{'role': 'system', 'content': 'sys'},
+                   {'role': 'user', 'content': 'hi'}]
+        agent = _make_agent(['/history', 'q', '/memory', '/chain', '/resume'])
+        agent.history = list(history)
+        result = _run_venue(agent)
+        self.assertEqual(result.status, ic.STATUS_RESUME)
+        self.assertEqual(agent.llm.calls, [])
+        self.assertEqual(agent.history, history)
 
 
 if __name__ == '__main__':
