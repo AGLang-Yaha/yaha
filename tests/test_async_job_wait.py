@@ -42,9 +42,13 @@ class _FakeAgent:
 
 
 class _Cfg:
-    def __init__(self, chain):
+    def __init__(self, chain, toolset=None):
         self.prompt_chain = chain
         self.system_prompt = ''
+        # None (the default) means "this double declares no toolset", which
+        # keeps the validator's legacy blanket exemption in force; pass a list
+        # to model a class that really authored its tools.
+        self.toolset = toolset
 
 
 def _sleep_runner(seconds, output='job-output'):
@@ -105,6 +109,24 @@ class JobWaitTests(unittest.TestCase):
     def test_validator_still_rejects_a_typo_wait(self):
         cfg = _Cfg([{'name': 'B', 'wait_event': 'ghost'}])
         self.assertEqual(validate_wait_events({'B': cfg}), ['ghost'])
+
+    def test_validator_rejects_async_wait_when_no_async_tool_declared(self):
+        # A class that authored a toolset WITHOUT the async family can never
+        # start a job, so an ``async-<n>`` wait is a typo - not an exemption.
+        cfg = _Cfg([{'name': 'B', 'wait_event': 'async-1'}],
+                   toolset=['bash_tool'])
+        self.assertEqual(validate_wait_events({'B': cfg}), ['async-1'])
+
+    def test_validator_accepts_async_wait_when_async_tool_declared(self):
+        cfg = _Cfg([{'name': 'B', 'wait_event': 'async-1'}],
+                   toolset=['bash_tool', 'async_bash'])
+        self.assertEqual(validate_wait_events({'B': cfg}), [])
+
+    def test_validator_keeps_exemption_when_toolset_unknown(self):
+        # No toolset info anywhere -> cannot tell -> keep the legacy exemption
+        # (this is also what keeps the pre-existing test above passing).
+        cfg = _Cfg([{'name': 'B', 'wait_event': 'async-1'}])
+        self.assertEqual(validate_wait_events({'B': cfg}), [])
 
 
 

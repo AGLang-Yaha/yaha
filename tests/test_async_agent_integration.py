@@ -4,6 +4,7 @@
 
 # Agent-level wiring tests for the async tools (async_bash / poll_async).
 
+import pathlib
 import threading
 import time
 import unittest
@@ -116,9 +117,16 @@ class OwnerScopeTests(unittest.TestCase):
         self.assertIn('for-A', a.history[0]['content'])
 
 
+# Resolve the tree under test from THIS file, never from the CWD: a relative
+# path would read the MAIN checkout (or raise FileNotFoundError) when the
+# suite is launched from anywhere but the worktree root.
+_AGENT_PY = (pathlib.Path(__file__).resolve().parents[1]
+             / 'yaha' / 'core' / 'agent.py')
+
+
 class GuardWiringTests(unittest.TestCase):
     def test_async_bash_tool_map_entry_is_guarded(self):
-        src = open('yaha/core/agent.py').read()
+        src = _AGENT_PY.read_text(encoding='utf-8')
         self.assertIn('"async_bash": self._async_bash_tool_with_guard', src)
 
     def test_async_bash_guard_uses_the_guarded_ui(self):

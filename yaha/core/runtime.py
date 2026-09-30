@@ -800,6 +800,47 @@ def collect_producer_events(agent_classes):
     return producers
 
 
+# The async shell-tool family (see ``yaha/tools/async_tools.py``). A class that
+# declares one of these in its ``toolset`` is the only kind of class that can
+# ever start a job, so only such a workspace may wait on an ``async-<n>`` id.
+ASYNC_TOOL_NAMES = ("async_bash", "poll_async")
+
+
+def _declares_async_tool(cfg):
+    """True/False when ``cfg`` declares a toolset, None when it does not.
+
+    ``AgentClassConfig`` always carries a ``toolset``, but lightweight test
+    doubles may not - and an EMPTY toolset carries no information either, since
+    a class can inherit its tools. Only a non-empty list of names is treated as
+    authoritative.
+    """
+    toolset = getattr(cfg, "toolset", None)
+    if not toolset:
+        return None
+    names = [toolset] if isinstance(toolset, str) else list(toolset)
+    return any(str(name).strip() in ASYNC_TOOL_NAMES for name in names)
+
+
+def async_tools_declared(agent_classes):
+    """True/False/None: does some class declare an async shell tool?
+
+    ``True``  - an async tool is declared, so job-id waits are legitimate.
+    ``False`` - at least one class declares a toolset and NONE of them mentions
+                an async tool, so an ``async-<n>`` wait is a typo.
+    ``None``  - no class declares a toolset at all: the validator cannot tell,
+                so callers must keep the legacy blanket exemption rather than
+                break a workspace that enables the tools by inheritance.
+    """
+    verdict = None
+    for cfg in (agent_classes or {}).values():
+        declared = _declares_async_tool(cfg)
+        if declared is True:
+            return True
+        if declared is False:
+            verdict = False
+    return verdict
+
+
 def validate_wait_events(agent_classes):
     """Return a list of Wait Event names with no known producer.
 
@@ -813,10 +854,17 @@ def validate_wait_events(agent_classes):
     accepted when ANY prompt produces a placeholder, because a binding could map
     that placeholder onto this name. A workspace that never mentions the
     placeholder prefix keeps the old behaviour byte for byte.
+
+    An ``async-<n>`` wait is exempt while the workspace can actually start a
+    job (see ``async_tools_declared``); a job-id-shaped wait in a workspace
+    that PROVABLY declares no async shell tool is reported as missing rather
+    than silently hanging the run.
     """
     waits = collect_wait_events(agent_classes)
     producers = collect_producer_events(agent_classes)
     late_binding_possible = any(is_placeholder(name) for name in producers)
+    # True/None -> exempt (enabled, or we cannot tell); False -> report a typo.
+    async_wait_exempt = async_tools_declared(agent_classes) is not False
 
     missing = []
     for name in waits:
@@ -834,7 +882,15 @@ def validate_wait_events(agent_classes):
             # An async job PRODUCES its own event when it finishes (the
             # runtime sets the job id), so a wait on it has no `set_event_*`
             # prompt literal either - the same exemption an endpoint gets.
-            continue
+            #
+            # TIGHTER than a blanket exemption: it applies only while the
+            # workspace could actually start a job, i.e. while some class
+            # declares an async shell tool (or while no class declares a
+            # toolset at all, in which case we cannot tell and must not guess).
+            # A job-id-shaped wait in a workspace that provably has no async
+            # tools is a typo and is reported instead of hanging the run.
+            if async_wait_exempt:
+                continue
         if late_binding_possible:
             continue
         missing.append(name)

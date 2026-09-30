@@ -8,6 +8,7 @@ from bs4 import BeautifulSoup
 
 from .output_guard import guard_output
 
+
 def format_shell_output(stdout, stderr, max_output_bytes=None):
     """Join a command's stdout/stderr the way a tool result expects.
 

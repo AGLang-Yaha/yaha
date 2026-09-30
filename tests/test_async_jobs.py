@@ -156,6 +156,60 @@ class RegistryTests(unittest.TestCase):
 
 
 
+class _RecordingJob(J.AsyncJob):
+    """An AsyncJob that records the ORDER of its attribute writes.
+
+    ``status`` is the visibility marker every reader polls, so the contract is
+    "payload first, terminal status last". A plain race cannot be asserted
+    deterministically from a test, but asserting the write ORDER fails loudly
+    the moment somebody reverts the ordering.
+    """
+
+    __slots__ = ('writes',)
+
+    def __setattr__(self, name, value):
+        if name == 'writes':
+            object.__setattr__(self, name, value)
+            return
+        try:
+            self.writes.append(name)
+        except AttributeError:
+            pass  # __init__ assigns before the recorder exists
+        object.__setattr__(self, name, value)
+
+
+class FinishPublicationTests(unittest.TestCase):
+    def _recording_job(self):
+        job = _RecordingJob('async-1', 'cmd', owner='a')
+        job.writes = []
+        return job
+
+    def test_finish_publishes_status_last(self):
+        job = self._recording_job()
+        job.finish(J.DONE, 'the-output', None)
+        self.assertEqual(job.writes[-1], 'status')
+        self.assertLess(job.writes.index('output'), job.writes.index('status'))
+        self.assertLess(job.writes.index('error'), job.writes.index('status'))
+        self.assertLess(job.writes.index('finished_at'),
+                        job.writes.index('status'))
+
+    def test_snapshot_is_consistent_after_finish(self):
+        job = J.AsyncJob('async-1', 'cmd')
+        job.finish(J.ERROR, '', 'boom')
+        snap = job.snapshot()
+        self.assertEqual(snap['status'], J.ERROR)
+        self.assertEqual(snap['error'], 'boom')
+        self.assertIsNotNone(job.finished_at)
+
+    def test_late_finish_cannot_resurrect_cancelled_job(self):
+        # Guards the reorder against the other invariant `finish` carries.
+        job = J.AsyncJob('async-1', 'cmd')
+        job.finish(J.CANCELLED, '', 'cancelled at shutdown')
+        job.finish(J.DONE, 'late', None)
+        self.assertEqual(job.status, J.CANCELLED)
+        self.assertEqual(job.output, '')
+
+
 class OwnerDrainTests(unittest.TestCase):
     def test_allocate_records_owner(self):
         reg = J.AsyncJobRegistry()

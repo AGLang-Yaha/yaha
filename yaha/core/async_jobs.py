@@ -78,13 +78,22 @@ class AsyncJob:
         A CANCELLED job is terminal: ``shutdown`` may kill a child while its
         worker is still unwinding, so the worker's late ``finish`` must not
         resurrect the job as DONE.
+
+        PUBLICATION ORDER: the payload (``output`` / ``error`` /
+        ``finished_at``) is written BEFORE the terminal ``status``, because
+        ``status`` is the visibility marker every reader polls (``is_live``,
+        ``drain_finished``, ``snapshot``). Publishing it last guarantees a
+        reader that observes a terminal status also observes the matching
+        payload - the reverse order lets a watcher see DONE/ERROR with a stale
+        (empty) result.
         """
         if self.status == CANCELLED:
             return self
-        self.status = status
         self.output = output or ""
         self.error = error
         self.finished_at = time.monotonic()
+        # Terminal status LAST - see PUBLICATION ORDER above.
+        self.status = status
         return self
 
     def elapsed(self):
