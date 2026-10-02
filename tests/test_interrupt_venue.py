@@ -1246,5 +1246,36 @@ class InterruptSpawnStackTests(unittest.TestCase):
         self.assertTrue(any('spawn failed' in w for w in agent._printed['warnings']))
 
 
+class TestInterruptPromptChar(unittest.TestCase):
+    '''The interrupt venue uses a `!` prompt char, distinct from `>`.'''
+
+    def test_interrupt_read_default_prompt_is_bang(self):
+        from yaha.ui.terminal import YAHAUI
+        ui = YAHAUI()
+        with patch('builtins.input', return_value='hello') as m:
+            result = ui.interrupt_read()
+        self.assertEqual(result, 'hello')
+        self.assertEqual(m.call_args.args[0], '! ')
+
+    def test_history_pager_prompt_uses_bang(self):
+        calls = []
+        agent = _make_agent(['/history', 'q'])
+
+        def spy(*a, **k):
+            calls.append(a)
+            return agent._box.pop(0) if agent._box else None
+
+        agent.ui.interrupt_read = spy
+        _run_venue(agent)
+        self.assertIn(('history! ',), calls)
+
+    def test_normal_ask_user_prompt_unchanged(self):
+        from yaha.ui.terminal import YAHAUI
+        ui = YAHAUI()
+        with patch('builtins.input', return_value='ans') as m:
+            ui.prompt_user('A', 'id1', 'q?')
+        self.assertEqual(m.call_args.args[0], '> ')
+
+
 if __name__ == '__main__':
     unittest.main()
