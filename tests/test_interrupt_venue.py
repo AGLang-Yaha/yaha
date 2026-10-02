@@ -36,6 +36,26 @@ class _FakeTTY:
         return self._is_tty
 
 
+class _FakeListener:
+    '''Counts the REAL suspend/resume transitions of a shared controller.'''
+
+    def __init__(self):
+        self.suspends = 0
+        self.resumes = 0
+
+    def suspend(self):
+        self.suspends += 1
+
+    def resume(self):
+        self.resumes += 1
+
+    def stop(self):
+        pass
+
+    def start(self):
+        pass
+
+
 class _ScriptedLLM:
     '''Deterministic provider: returns scripted answers, records the messages.'''
 
@@ -83,7 +103,9 @@ def _make_agent(lines, llm=None, stage=None):
     agent.agent_classes = {}
     agent.runtime = None
     agent.yaha_load_classes = None
+    agent.yaha_spawn_frame = None
     agent._venue_stack = []
+    agent.current_task_prompt = 'the task'
     agent.stdin_interrupt = None
     agent._serving_interrupt = False
     agent._compressing = False
@@ -99,8 +121,10 @@ def _make_agent(lines, llm=None, stage=None):
     agent.api_retry_unattended_max_rounds = 3
     agent.turn_limit = 200
     agent.logger = types.SimpleNamespace(log_turn=lambda *a, **k: None)
-    agent._interrupt_suspend = lambda: None
-    agent._interrupt_resume = lambda: None
+    # Use the REAL suspend/resume: they are no-ops when stdin_interrupt is
+    # None, and they exercise a supplied controller (the rev1 nesting test).
+    agent._interrupt_suspend = Agent._interrupt_suspend.__get__(agent)
+    agent._interrupt_resume = Agent._interrupt_resume.__get__(agent)
     agent.llm = llm or _ScriptedLLM(['a model answer'])
     box = list(lines)
     printed = {'answers': [], 'help': [], 'status': [], 'notes': [], 'warnings': [], 'info': [], 'list': []}
@@ -121,10 +145,11 @@ def _make_agent(lines, llm=None, stage=None):
     return agent
 
 
-def _run_venue(agent, stage=None, is_tty=True):
+def _run_venue(agent, stage=None, is_tty=True, frames=None, spawned=False):
     stage = stage if stage is not None else {'name': 'Coding'}
     with patch('sys.stdin', _FakeTTY(is_tty)):
-        return Agent._serve_interrupt_venue(agent, stage, 2, set())
+        return Agent._serve_interrupt_venue(agent, stage, 2, set(),
+                                            frames=frames, spawned=spawned)
 
 
 # --- table / help ----------------------------------------------------------
@@ -340,10 +365,14 @@ def test_call_and_spawn_display_output():
     _run_venue(agent)
     assert agent._printed['answers'] == ['detached digest'], agent._printed['answers']
 
+    # `/spawn` now PUSHES a frame and enters the child's venue (Round 2); the
+    # one-shot digest behaviour lives on `/call`.
+    child = _make_agent(['/quit', '/resume'])
     agent = _make_agent(['/spawn NoAgent do it', '/resume'])
-    agent.yaha_spawn_agent = lambda system, instruction, agent_class=None: 'spawn digest'
+    agent.yaha_spawn_frame = lambda agent_class, runtime=None: child
     _run_venue(agent)
-    assert agent._printed['answers'] == ['spawn digest'], agent._printed['answers']
+    assert any('pushed frame' in n for n in agent._printed['notes']), agent._printed['notes']
+    assert any('popped frame' in n for n in agent._printed['notes']), agent._printed['notes']
 
     agent = _make_agent(['/call Missing', '/resume'])
     _run_venue(agent)
@@ -891,6 +920,330 @@ class InterruptListLoadHistoryTests(unittest.TestCase):
         agent.runtime = self._peer_runtime(peer)
         _run_venue(agent)
         self.assertEqual(peer.history, before)
+
+
+class InterruptSpawnStackTests(unittest.TestCase):
+    '''Round 2: /spawn + /quit push/pop venue stack, /agent_stack, /resume.'''
+
+    # --- table / help -----------------------------------------------------
+
+    def test_spawn_quit_agent_stack_table(self):
+        names = [c.name for c in ic.INTERRUPT_COMMANDS]
+        for n in ('spawn', 'quit', 'agent_stack'):
+            self.assertIn(n, names)
+        spec = ic.lookup('agent_stack')
+        self.assertEqual(spec.kind, ic.KIND_LOOP)
+        self.assertEqual(spec.arg, ic.ARG_NONE)
+        self.assertTrue(ic.STATUS_POP)
+
+    def test_help_mentions_push_pop_and_stack(self):
+        menu = ic.render_help()
+        self.assertIn('/spawn <AgentClass> <task>', menu)
+        self.assertIn('/agent_stack', menu)
+        self.assertIn('pop one venue frame', menu)
+
+    def test_label_for_status_pop(self):
+        self.assertEqual(ic.label_for_status(ic.STATUS_POP), 'pop')
+
+    # --- push / pop -------------------------------------------------------
+
+    def _child(self, lines, name='NoAgent', aid='kid001'):
+        child = _make_agent(lines, stage={'name': 'Spawned'})
+        child.config.name = name
+        child.agent_id = aid
+        return child
+
+    def test_spawn_pushes_frame_and_enters_child_venue(self):
+        child = self._child(['/quit'])
+        agent = _make_agent(['/spawn NoAgent go', '/resume'])
+        seen = []
+
+        def factory(cls, runtime=None):
+            seen.append((cls, runtime))
+            return child
+
+        agent.yaha_spawn_frame = factory
+        result = _run_venue(agent)
+        self.assertEqual(result.status, ic.STATUS_RESUME)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], 'NoAgent')
+        self.assertTrue(any('pushed frame' in n for n in agent._printed['notes']))
+        self.assertTrue(any('popped frame' in n for n in agent._printed['notes']))
+
+    def test_spawn_factory_error_warns(self):
+        agent = _make_agent(['/spawn Ghost go', '/resume'])
+        agent.yaha_spawn_frame = lambda cls, runtime=None: (
+            "Error: Agent class 'Ghost' is not authorized for this agent.")
+        _run_venue(agent)
+        self.assertTrue(any('not authorized' in w for w in agent._printed['warnings']))
+
+    def test_spawn_missing_class_warns(self):
+        agent = _make_agent(['/spawn', '/resume'])
+        _run_venue(agent)
+        # ARG_REQUIRED fires the usage warning before the handler.
+        self.assertTrue(any('Usage: /spawn' in w for w in agent._printed['warnings']))
+
+    def test_spawn_unavailable_warns(self):
+        agent = _make_agent(['/spawn NoAgent go', '/resume'])
+        agent.yaha_spawn_frame = None
+        _run_venue(agent)
+        self.assertTrue(any('not available' in w for w in agent._printed['warnings']))
+
+    def test_quit_at_root_routes_to_fail_target(self):
+        agent = _make_agent(['/quit'])
+        result = _run_venue(agent, stage={'name': 'Coding', 'fail_target': 'Plan'})
+        self.assertEqual(result.status, 'FAIL:Plan')
+
+    def test_quit_in_spawned_frame_pops(self):
+        agent = _make_agent(['/quit'])
+        frames = [{'agent': agent, 'task': 't', 'handle': None,
+                   'name': 'TestAgent/abc123', 'root': True}]
+        result = _run_venue(agent, frames=frames, spawned=True)
+        self.assertEqual(result.status, ic.STATUS_POP)
+
+    def test_nested_spawn_pushes_two_frames(self):
+        grandchild = self._child(['/quit'], name='Deep', aid='gc0001')
+        child = self._child(['/spawn Deep go', '/quit'], name='NoAgent', aid='kid001')
+        child.yaha_spawn_frame = lambda cls, runtime=None: grandchild
+        agent = _make_agent(['/spawn NoAgent go', '/resume'])
+        agent.yaha_spawn_frame = lambda cls, runtime=None: child
+        _run_venue(agent)
+        root_notes = ' | '.join(agent._printed['notes'])
+        child_notes = ' | '.join(child._printed['notes'])
+        # The root pushed the child (depth 2) and the child pushed the grandchild
+        # (depth 3): "pushed frame N" is the shared stack length at push time.
+        self.assertIn('pushed frame 2', root_notes)
+        self.assertIn('pushed frame 3', child_notes)
+        self.assertIn('popped frame', root_notes)
+        self.assertIn('popped frame', child_notes)
+
+    def test_pop_returns_to_parent_and_notes(self):
+        child = self._child(['/quit'])
+        agent = _make_agent(['/spawn NoAgent go', '/resume'])
+        agent.yaha_spawn_frame = lambda cls, runtime=None: child
+        result = _run_venue(agent)
+        self.assertEqual(result.status, ic.STATUS_RESUME)
+        self.assertTrue(any('popped frame' in n for n in agent._printed['notes']))
+
+    def test_spawn_exception_pops_frame(self):
+        child = self._child(['/quit'])
+
+        def boom(*a, **k):
+            raise RuntimeError('child blew up')
+
+        child._serve_interrupt_venue = boom
+        agent = _make_agent(['/spawn NoAgent go', '/resume'])
+        agent.yaha_spawn_frame = lambda cls, runtime=None: child
+        with self.assertRaises(RuntimeError):
+            _run_venue(agent)
+        # The child frame is popped in the finally; only the seeded root remains.
+        self.assertEqual(len(agent._venue_stack), 1)
+        self.assertTrue(agent._venue_stack[0].get('root'))
+
+    # --- /agent_stack -----------------------------------------------------
+
+    def test_agent_stack_at_root_only(self):
+        agent = _make_agent(['/agent_stack', '/resume'])
+        _run_venue(agent)
+        head = agent._printed['info'][0]
+        self.assertIn('root only', head)
+        title, items, columns = agent._printed['list'][0]
+        self.assertEqual(columns, ['#', 'Frame', 'Class', 'ID', 'State', 'Wait'])
+        self.assertEqual(items[0][4], 'root')
+        self.assertIn('<- current', items[0][1])
+
+    def test_agent_stack_depth_and_current_marker(self):
+        agent = _make_agent(['/agent_stack', 'q', '/resume'])
+        child = self._child(['/agent_stack', '/quit'], name='NoAgent', aid='kid001')
+        frames = [
+            {'agent': agent, 'task': 't', 'handle': None,
+             'name': 'TestAgent/abc123', 'root': True},
+            {'agent': child, 'task': 'go', 'handle': None, 'name': 'NoAgent/kid001'},
+        ]
+        agent._venue_stack = frames
+        # Serve the CHILD's venue so it is the current frame.
+        _run_venue(child, frames=frames, spawned=True)
+        title, items, columns = child._printed['list'][0]
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0][4], 'root')
+        self.assertEqual(items[1][4], 'pending')
+        self.assertIn('<- current', items[1][1])
+        self.assertNotIn('<- current', items[0][1])
+
+    def test_agent_stack_shows_parked_wait(self):
+        runtime = types.SimpleNamespace(
+            pool={},
+            waiting={'review_done': [types.SimpleNamespace(name='agent-7')]},
+            active_name=lambda: '', max_agents=1)
+        root = _make_agent(['/resume'])
+        child = self._child(['/agent_stack', '/quit'], name='NoAgent', aid='kid001')
+        child.runtime = runtime
+        frames = [
+            {'agent': root, 'task': 't', 'handle': None,
+             'name': 'TestAgent/abc123', 'root': True},
+            {'agent': child, 'task': 'go', 'handle': 'agent-7', 'name': 'NoAgent/kid001'},
+        ]
+        _run_venue(child, frames=frames, spawned=True)
+        title, items, columns = child._printed['list'][0]
+        self.assertEqual(items[1][4], 'handle:agent-7')
+        self.assertIn('review_done', items[1][5])
+
+    def test_agent_stack_read_only(self):
+        agent = _make_agent(['/agent_stack', '/resume'])
+        before = list(agent.history)
+        _run_venue(agent)
+        self.assertEqual(agent.history, before)
+        self.assertEqual(agent.llm.calls, [])
+
+    # --- /resume of a spawned frame ---------------------------------------
+
+    def test_resume_sync_runs_child_without_runtime(self):
+        child = self._child(['/resume'])
+        calls = []
+        child.run = lambda task, seed_history=None: (calls.append(task), 'child answer')[1]
+        frames = [
+            {'agent': child, 'task': 'do the thing', 'handle': None,
+             'name': 'NoAgent/kid001'},
+        ]
+        result = _run_venue(child, frames=frames, spawned=True)
+        self.assertEqual(result.status, ic.STATUS_POP)
+        self.assertEqual(calls, ['do the thing'])
+        self.assertTrue(any('finished' in n for n in child._printed['notes']))
+
+    def test_resume_group_empty_pops(self):
+        child = self._child(['/resume'])
+        ran = []
+        child.runtime = types.SimpleNamespace(
+            pool={},
+            spawn=lambda agent, task, name=None, tag=None: (
+                ran.append(task), types.SimpleNamespace(name='agent-1'))[1],
+            run_group=lambda names: 'empty',
+        )
+        frames = [{'agent': child, 'task': 'do it', 'handle': None, 'name': 'NoAgent/kid001'}]
+        result = _run_venue(child, frames=frames, spawned=True)
+        self.assertEqual(result.status, ic.STATUS_POP)
+        self.assertEqual(ran, ['do it'])
+
+    def test_resume_group_blocked_stays(self):
+        child = self._child(['/resume', '/quit'])
+        child.runtime = types.SimpleNamespace(
+            pool={},
+            spawn=lambda agent, task, name=None, tag=None: types.SimpleNamespace(name='agent-1'),
+            run_group=lambda names: 'blocked',
+            waiting={'endpoint_a': [types.SimpleNamespace(name='agent-1')]},
+        )
+        frames = [{'agent': child, 'task': 'do it', 'handle': None, 'name': 'NoAgent/kid001'}]
+        result = _run_venue(child, frames=frames, spawned=True)
+        self.assertEqual(result.status, ic.STATUS_POP)
+        self.assertTrue(any('blocked' in n for n in child._printed['notes']),
+                        child._printed['notes'])
+
+    def test_resume_steer_text_prepended(self):
+        child = self._child(['/resume focus on logs'])
+        calls = []
+        child.run = lambda task, seed_history=None: (calls.append(task), 'ok')[1]
+        frames = [{'agent': child, 'task': 'do it', 'handle': None, 'name': 'NoAgent/kid001'}]
+        _run_venue(child, frames=frames, spawned=True)
+        self.assertTrue(calls)
+        self.assertIn('do it', calls[0])
+        self.assertIn('focus on logs', calls[0])
+
+
+    # --- rev1: nest-safe stdin hold --------------------------------------
+
+    def test_controller_suspend_is_reentrant(self):
+        from yaha.ui.interrupt import StdinInterruptController
+        ctl = StdinInterruptController()
+        fake = _FakeListener()
+        ctl.listener = fake
+        ctl.suspend()
+        ctl.suspend()
+        self.assertEqual(fake.suspends, 1, 'a nested suspend must not suspend twice')
+        self.assertTrue(ctl.suspended)
+        ctl.resume()
+        self.assertEqual(fake.resumes, 0, 'an inner resume must not release the hold')
+        self.assertTrue(ctl.suspended)
+        ctl.resume()
+        self.assertEqual(fake.resumes, 1)
+        self.assertFalse(ctl.suspended)
+
+    def test_stdin_hold_survives_a_child_frame(self):
+        from yaha.ui.interrupt import StdinInterruptController
+        ctl = StdinInterruptController()
+        fake = _FakeListener()
+        ctl.listener = fake
+        child = self._child(['/quit'])
+        child.stdin_interrupt = ctl
+        agent = _make_agent(['/spawn NoAgent go', '/resume'])
+        agent.stdin_interrupt = ctl
+        agent.yaha_spawn_frame = lambda cls, runtime=None: child
+        _run_venue(agent)
+        # The parent suspended once and resumed once; the nested child neither
+        # suspended nor released the shared controller.
+        self.assertEqual(fake.suspends, 1)
+        self.assertEqual(fake.resumes, 1)
+        self.assertEqual(ctl.suspend_depth, 0)
+
+    # --- rev1: chain moves are rejected inside a spawned frame -----------
+
+    def test_rewind_restart_jump_rejected_in_spawned_frame(self):
+        agent = _make_agent(['/rewind', '/restart', '/jump X', '/quit'])
+        frames = [{'agent': agent, 'task': 't', 'handle': None,
+                   'name': 'TestAgent/abc123', 'root': True}]
+        result = _run_venue(agent, frames=frames, spawned=True)
+        self.assertEqual(result.status, ic.STATUS_POP)
+        warnings = ' | '.join(agent._printed['warnings'])
+        for cmd in ('/rewind', '/restart', '/jump'):
+            self.assertIn(cmd, warnings)
+
+    def test_root_frame_still_allows_chain_moves(self):
+        agent = _make_agent(['/rewind'])
+        result = _run_venue(agent)
+        self.assertEqual(result.status, ic.STATUS_REWIND)
+
+    # --- rev1: runtime result + factory call shape ------------------------
+
+    def test_resume_group_empty_reports_child_answer(self):
+        child = self._child(['/resume'])
+        handle = types.SimpleNamespace(name='agent-1', result='the child answer')
+        child.runtime = types.SimpleNamespace(
+            pool={},
+            spawn=lambda agent, task, name=None, tag=None: handle,
+            run_group=lambda names: 'empty',
+        )
+        frames = [{'agent': child, 'task': 'do it', 'handle': None, 'name': 'NoAgent/kid001'}]
+        _run_venue(child, frames=frames, spawned=True)
+        self.assertTrue(any('the child answer' in n for n in child._printed['notes']),
+                        child._printed['notes'])
+
+    def test_spawn_calls_factory_with_runtime(self):
+        child = self._child(['/quit'])
+        agent = _make_agent(['/spawn NoAgent go', '/resume'])
+        agent.runtime = types.SimpleNamespace(pool={}, active_name=lambda: '', max_agents=1)
+        calls = []
+
+        def factory(cls, runtime=None):
+            calls.append((cls, runtime))
+            return child
+
+        agent.yaha_spawn_frame = factory
+        _run_venue(agent)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], 'NoAgent')
+        self.assertIs(calls[0][1], agent.runtime)
+
+    def test_spawn_factory_typeerror_reported_once(self):
+        calls = []
+
+        def boom(cls, runtime=None):
+            calls.append(cls)
+            raise TypeError('internal boom')
+
+        agent = _make_agent(['/spawn NoAgent go', '/resume'])
+        agent.yaha_spawn_frame = boom
+        _run_venue(agent)
+        self.assertEqual(len(calls), 1, 'a factory TypeError must not double-invoke')
+        self.assertTrue(any('spawn failed' in w for w in agent._printed['warnings']))
 
 
 if __name__ == '__main__':

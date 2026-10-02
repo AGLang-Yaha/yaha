@@ -145,5 +145,62 @@ class VenueLoadTests(unittest.TestCase):
         self.assertEqual(set(engine.agent_classes), before)
 
 
+class VenueSpawnFrameTests(unittest.TestCase):
+    '''T22/T23: the engine's build-only /spawn factory.'''
+
+    def tearDown(self):
+        for attr in ('workspace',):
+            path = getattr(self, attr, None)
+            if path is not None:
+                shutil.rmtree(str(path), ignore_errors=True)
+
+    def _wired_agent(self, workspace):
+        engine = YAHAEngine(workspace_dir=str(workspace))
+        cfg = engine.resolve_agent_class('BaseAgent')
+        agent = engine._make_agent(cfg, caller_id=None, recursion_depth=0)
+        return engine, agent
+
+    def test_spawn_frame_builds_without_running(self):
+        self.workspace = template_workspace()
+        engine, agent = self._wired_agent(self.workspace)
+        child = agent.yaha_spawn_frame('BaseAgent')
+        self.assertIsNotNone(child)
+        self.assertFalse(isinstance(child, str), child)
+        # Built but NOT run: no history was initialised.
+        self.assertEqual(child.history, [])
+
+    def test_spawn_frame_unauthorized(self):
+        self.workspace = template_workspace()
+        engine, agent = self._wired_agent(self.workspace)
+        report = agent.yaha_spawn_frame('DefinitelyNotAuthorized')
+        self.assertTrue(isinstance(report, str))
+        self.assertIn('Error', report)
+
+    def test_spawn_frame_unknown_class(self):
+        self.workspace = template_workspace()
+        engine, agent = self._wired_agent(self.workspace)
+        # 'Inherited' resolves to the agent's own class, so it is authorized.
+        child = agent.yaha_spawn_frame('Inherited')
+        self.assertFalse(isinstance(child, str), child)
+
+    def test_spawn_frame_sets_child_runtime(self):
+        '''A runtime passed to the factory is wired onto the child (MAJOR 1).'''
+        from yaha.core.runtime import AgentRuntime
+        self.workspace = template_workspace()
+        engine, agent = self._wired_agent(self.workspace)
+        runtime = AgentRuntime()
+        child = agent.yaha_spawn_frame('BaseAgent', runtime)
+        self.assertFalse(isinstance(child, str), child)
+        self.assertIs(child.runtime, runtime,
+                      'the child must receive the runtime so /resume uses run_group')
+
+    def test_spawn_frame_without_runtime_leaves_runtime_none(self):
+        self.workspace = template_workspace()
+        engine, agent = self._wired_agent(self.workspace)
+        child = agent.yaha_spawn_frame('BaseAgent')
+        self.assertFalse(isinstance(child, str), child)
+        self.assertIsNone(child.runtime)
+
+
 if __name__ == '__main__':
     unittest.main()
