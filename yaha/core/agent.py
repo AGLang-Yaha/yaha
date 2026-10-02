@@ -413,6 +413,9 @@ class Agent:
         # this agent only suspends it around prompts and polls it for Esc.
         self.runtime = None
         self.stdin_interrupt = None
+        # Engine-wired callback for the venue /load command (dynamic Agent
+        # Class loading); None when the agent was not built by YAHAEngine.
+        self.yaha_load_classes = None
         self._serving_interrupt = False
         # Stage hooks (preenter/pretool/posttool/preexit). Lazily created on the
         # first hook of a stage; a class that declares no hooks never allocates
@@ -2431,26 +2434,30 @@ class Agent:
 
     # --- venue inspection helpers (read-only, model-free) -------------------
 
-    def _venue_history_page(self, page, page_size):
+    def _venue_history_page(self, page, page_size, history=None, label=''):
         """Render one page of the venue history browser.
 
-        Returns (text, page, pages). Pages are ordered oldest -> newest.
+        `history` defaults to this agent's own; `label` names the owner when the
+        pager is showing ANOTHER agent's history. Returns (text, page, pages).
+        Pages are ordered oldest -> newest.
         """
-        total = len(self.history)
+        history = self.history if history is None else history
+        total = len(history)
         try:
             page_size = max(1, min(100, int(page_size)))
         except (TypeError, ValueError):
             page_size = 10
+        owner = ('history of ' + label) if label else 'history'
         if total == 0:
-            return ('history: 0 messages' + chr(10) + 'nav: q=quit', 1, 1)
+            return (owner + ': 0 messages' + chr(10) + 'nav: q=quit', 1, 1)
         pages = (total + page_size - 1) // page_size
         page = max(1, min(int(page), pages))
         start = (page - 1) * page_size
         end = min(total, start + page_size)
-        lines = ['history: %d messages  (page %d/%d)  showing [%d-%d]'
-                 % (total, page, pages, start, end - 1)]
+        lines = ['%s: %d messages  (page %d/%d)  showing [%d-%d]'
+                 % (owner, total, page, pages, start, end - 1)]
         for idx in range(start, end):
-            msg = self.history[idx]
+            msg = history[idx]
             role = str(msg.get('role') or '?')
             body = str(msg.get('content') or '').replace(chr(10), ' ').strip()
             if len(body) > 100:
@@ -2459,21 +2466,108 @@ class Agent:
         lines.append('nav: n=next page  p=prev page  g <page>  d <idx>=detail  q=quit')
         return (chr(10).join(lines), page, pages)
 
+    def _venue_available_ids(self):
+        """A short 'available: ...' list for an unknown-ID warning."""
+        ids = ['%s/%s' % (self.config.name, self.agent_id)]
+        runtime = getattr(self, 'runtime', None)
+        pool = getattr(runtime, 'pool', None) if runtime is not None else None
+        for handle in list((pool or {}).values()):
+            agent = getattr(handle, 'agent', None)
+            aid = str(getattr(agent, 'agent_id', '') or '')
+            hname = str(getattr(handle, 'name', '') or '')
+            if hname or aid:
+                ids.append('%s/%s' % (hname or '?', aid or '?'))
+        for frame in list(getattr(self, '_venue_stack', []) or []):
+            if isinstance(frame, dict) and frame.get('agent') is not None:
+                ids.append('%s/%s' % (frame.get('name') or '?',
+                                      getattr(frame['agent'], 'agent_id', '?')))
+        return 'available: ' + ', '.join(ids)
+
+    def _venue_find_history_target(self, token):
+        """Resolve an /history ID to (agent, label), or None.
+
+        Matches, in order: this agent (by id or class name), a runtime pool
+        handle (by handle name or the agent's id), then a venue frame (by frame
+        name or the agent's id).
+        """
+        want = str(token or '').strip()
+        if not want:
+            return None
+        if want == self.agent_id or want.lower() == str(self.config.name).lower():
+            return (self, '')
+        runtime = getattr(self, 'runtime', None)
+        pool = getattr(runtime, 'pool', None) if runtime is not None else None
+        for handle in list((pool or {}).values()):
+            agent = getattr(handle, 'agent', None)
+            if agent is None:
+                continue
+            hname = str(getattr(handle, 'name', '') or '')
+            aid = str(getattr(agent, 'agent_id', '') or '')
+            if want == hname or (aid and want == aid):
+                return (agent, hname or aid)
+        for frame in list(getattr(self, '_venue_stack', []) or []):
+            if not isinstance(frame, dict):
+                continue
+            agent = frame.get('agent')
+            if agent is None:
+                continue
+            fname = str(frame.get('name', '') or '')
+            aid = str(getattr(agent, 'agent_id', '') or '')
+            if want == fname or (aid and want == aid):
+                return (agent, fname or aid)
+        return None
+
     def _venue_history_browser(self, arg):
-        """Interactive, read-only history pager for the venue /history command."""
+        """Interactive, read-only history pager for the venue /history command.
+
+        Usage: `/history [ID] [page-size]`. With no ID it pages THIS agent's
+        history (unchanged). With an ID it pages the matching agent's history -
+        matched by agent_id or instance/handle name across the runtime pool and
+        the venue frame stack. A lone NUMBER that matches no known ID keeps the
+        historical meaning: a page size for this agent.
+        """
         name = self.config.name
         agent_id = self.agent_id
+        target = self
+        label = ''
         page_size = 10
-        if arg:
+        tokens = str(arg).split() if arg else []
+        size_token = None
+        if len(tokens) == 1:
+            found = self._venue_find_history_target(tokens[0])
+            if found is not None:
+                target, label = found
+            else:
+                try:
+                    int(tokens[0])
+                    size_token = tokens[0]
+                except (TypeError, ValueError):
+                    # Not a known ID and not a number: warn, then fall back to
+                    # THIS agent's own history (the pre-ID /history behaviour).
+                    self.ui.display_warning(
+                        name, agent_id,
+                        "No agent matches ID '%s'. Showing your own history. %s"
+                        % (tokens[0], self._venue_available_ids()))
+        elif len(tokens) >= 2:
+            found = self._venue_find_history_target(tokens[0])
+            if found is None:
+                self.ui.display_warning(
+                    name, agent_id,
+                    "No agent matches ID '%s'. %s" % (tokens[0], self._venue_available_ids()))
+                return
+            target, label = found
+            size_token = tokens[1]
+        if size_token:
             try:
-                page_size = int(str(arg).strip())
+                page_size = int(size_token)
             except (TypeError, ValueError):
                 page_size = 10
         page_size = max(1, min(100, page_size))
-        total = len(self.history)
+        history = list(getattr(target, 'history', []) or [])
+        total = len(history)
         page = ((total + page_size - 1) // page_size) if total else 1
         while True:
-            text, page, pages = self._venue_history_page(page, page_size)
+            text, page, pages = self._venue_history_page(page, page_size, history, label)
             self.ui.interrupt_info(name, agent_id, 'Interrupt History', text)
             raw = self.ui.interrupt_read('history> ')
             if raw is None:
@@ -2501,14 +2595,14 @@ class Agent:
             operand = parts[1].strip() if len(parts) > 1 else ''
             if verb == 'g':
                 try:
-                    target = int(operand)
+                    target_page = int(operand)
                 except (TypeError, ValueError):
                     self.ui.display_warning(name, agent_id, 'Usage: g <page>')
                     continue
-                if target < 1 or target > pages:
+                if target_page < 1 or target_page > pages:
                     self.ui.display_warning(
-                        name, agent_id, 'Page %d is out of range 1..%d.' % (target, pages))
-                page = max(1, min(target, pages))
+                        name, agent_id, 'Page %d is out of range 1..%d.' % (target_page, pages))
+                page = max(1, min(target_page, pages))
                 continue
             if verb == 'd':
                 try:
@@ -2516,10 +2610,10 @@ class Agent:
                 except (TypeError, ValueError):
                     self.ui.display_warning(name, agent_id, 'Usage: d <idx>')
                     continue
-                if idx < 0 or idx >= len(self.history):
+                if idx < 0 or idx >= len(history):
                     self.ui.display_warning(name, agent_id, 'No message at index %d.' % idx)
                     continue
-                msg = self.history[idx]
+                msg = history[idx]
                 role = str(msg.get('role') or '?')
                 self.ui.interrupt_info(
                     name, agent_id, 'Interrupt History [%d] %s' % (idx, role),
@@ -2580,6 +2674,132 @@ class Agent:
                   % (before, after, before - after, bool(rebuilt),
                      before_count, self.compress_count))
         self.ui.interrupt_info(name, agent_id, 'Interrupt Compress', report)
+
+    def _venue_list(self, arg):
+        """Dispatch `/list <instance|agents>`."""
+        sub = str(arg or '').strip().lower()
+        if sub in ('instance', 'instances'):
+            self._venue_list_instances()
+            return
+        if sub in ('agents', 'agent', 'classes'):
+            self._venue_list_agents()
+            return
+        self.ui.display_warning(
+            self.config.name, self.agent_id, 'Usage: /list <instance|agents>')
+
+    def _venue_list_agents(self):
+        """List the live agent-class registry (mirrors the CLI --list agents)."""
+        classes = getattr(self, 'agent_classes', {}) or {}
+        current = str(getattr(self.config, 'name', '') or '')
+        items = []
+        for name in sorted(classes):
+            cfg = classes[name]
+            code = str(getattr(cfg, 'code', '') or '')
+            model = str(getattr(cfg, 'model', '') or '')
+            desc = str(getattr(cfg, 'description', '') or '')
+            if not desc:
+                prompt = str(getattr(cfg, 'system_prompt', '') or '')
+                if prompt.strip():
+                    desc = prompt.strip().splitlines()[0].strip()
+            label = name + (' (current)' if name == current else '')
+            items.append((label, code, model, desc))
+        self.ui.interrupt_list(
+            self.config.name, self.agent_id, 'Agent Classes', items,
+            ['Name', 'Code', 'Model', 'Description'])
+
+    @staticmethod
+    def _context_cell(agent):
+        """A compact 'NN%  used/window' context cell, guarded against stubs."""
+        if agent is None:
+            return '-'
+        try:
+            ratio = agent._context_usage_ratio()
+            window = int(getattr(agent, 'context_size', 0) or 0)
+            used = int(ratio * window)
+            return '%d%%  %d/%d' % (round(100 * ratio), used, window)
+        except Exception:
+            return '-'
+
+    def _venue_instance_rows(self):
+        """Rows describing every live agent instance the venue can see."""
+        rows = []
+        seen = set()
+        runtime = getattr(self, 'runtime', None)
+        pool = getattr(runtime, 'pool', None) if runtime is not None else None
+        for handle in list((pool or {}).values()):
+            agent = getattr(handle, 'agent', None)
+            hname = str(getattr(handle, 'name', '') or '?')
+            aid = str(getattr(agent, 'agent_id', '') or '?') if agent is not None else '?'
+            cls = str(getattr(getattr(agent, 'config', None), 'name', '') or '?')
+            status = str(getattr(handle, 'status', '') or '?')
+            wait = str(getattr(handle, 'wait_event', '') or '-') or '-'
+            rows.append((hname, cls, aid, status, wait, self._context_cell(agent)))
+            seen.add(aid)
+            seen.add(hname)
+        # Always include the venue's own agent, even without a runtime.
+        if self.agent_id not in seen:
+            rows.append((
+                'self', str(getattr(self.config, 'name', '') or '?'), self.agent_id,
+                'running', '-', self._context_cell(self)))
+        return rows
+
+    def _venue_list_instances(self):
+        """List every concurrent agent instance (class, id, status, wait, ctx)."""
+        runtime = getattr(self, 'runtime', None)
+        pool = getattr(runtime, 'pool', None) if runtime is not None else None
+        rows = self._venue_instance_rows()
+        if not pool:
+            self.ui.interrupt_info(
+                self.config.name, self.agent_id, 'Agent Instances',
+                'no multi-agent runtime - single agent')
+            self.ui.interrupt_list(
+                self.config.name, self.agent_id, 'Instances', rows,
+                ['Instance', 'Class', 'ID', 'Status', 'Wait Event', 'Context'])
+            return
+        active = ''
+        getter = getattr(runtime, 'active_name', None)
+        if callable(getter):
+            try:
+                active = str(getter() or '')
+            except Exception:
+                active = ''
+        head = 'instances: %d live  (max seen %s)' % (
+            len(pool), getattr(runtime, 'max_agents', '?'))
+        if active:
+            head += '  active: ' + active
+        self.ui.interrupt_info(
+            self.config.name, self.agent_id, 'Agent Instances', head)
+        self.ui.interrupt_list(
+            self.config.name, self.agent_id, 'Instances', rows,
+            ['Instance', 'Class', 'ID', 'Status', 'Wait Event', 'Context'])
+
+    def _venue_load(self, arg):
+        """Dynamically load an extra Agent Class file (the venue /load command)."""
+        name = self.config.name
+        agent_id = self.agent_id
+        path = str(arg or '').strip()
+        if not path:
+            self.ui.display_warning(name, agent_id, 'Usage: /load <path>')
+            return
+        loader = getattr(self, 'yaha_load_classes', None)
+        if loader is None:
+            self.ui.display_warning(
+                name, agent_id, 'class loading is not available in this context')
+            return
+        try:
+            report = loader(path)
+        except Exception as exc:
+            self.ui.display_warning(name, agent_id, 'load failed: %s' % exc)
+            return
+        text = str(report or '').strip() or 'load: done'
+        low = text.lower()
+        if (low.startswith('load: file not found')
+                or low.startswith('load: parse error')
+                or low.startswith('load: no path')
+                or low.startswith('load: no agent classes')):
+            self.ui.display_warning(name, agent_id, text)
+            return
+        self.ui.interrupt_info(name, agent_id, 'Interrupt Load', text)
 
     def _venue_spawn(self, arg):
         """Spawn a sub-agent from the venue and show its output."""
@@ -2665,6 +2885,12 @@ class Agent:
                     continue
                 if spec.name == 'compress':
                     self._venue_compress(stage)
+                    continue
+                if spec.name == 'list':
+                    self._venue_list(arg)
+                    continue
+                if spec.name == 'load':
+                    self._venue_load(arg)
                     continue
 
                 if spec.name == 'resume':
