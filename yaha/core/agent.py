@@ -2562,7 +2562,7 @@ class Agent:
         while True:
             text, page, pages = self._venue_history_page(page, page_size, history, label)
             self.ui.interrupt_info(name, agent_id, 'Interrupt History', text)
-            raw = self.ui.interrupt_read('history> ')
+            raw = self.ui.interrupt_read('history! ')
             if raw is None:
                 return
             key = str(raw).strip()
