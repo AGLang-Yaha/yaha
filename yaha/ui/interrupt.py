@@ -174,6 +174,11 @@ class StdinInterruptController:
         self.listener = None
         self._term_orig = None
         self._cbreak = False
+        # REF-COUNTED suspension: suspend()/resume() nest, so a child venue (or
+        # an ask_user) opened inside an already-suspended venue does not release
+        # the outer hold when it returns. The real listener/termios switch only
+        # flips on the outermost transition.
+        self._suspend_depth = 0
 
     # --- diagnostics ------------------------------------------------------
     @property
@@ -229,10 +234,29 @@ class StdinInterruptController:
                 pass
         self._term_orig = None
         self._cbreak = False
+        # Drop any outstanding hold: a stopped controller must start clean.
+        self._suspend_depth = 0
 
     # --- cooperative stdin ownership -------------------------------------
+    @property
+    def suspend_depth(self):
+        return self._suspend_depth
+
+    @property
+    def suspended(self):
+        """True while an outer holder still owns stdin (nest-safe)."""
+        return self._suspend_depth > 0
+
     def suspend(self):
-        """Hand stdin to a foreground prompt: stop reading, restore cooked."""
+        """Hand stdin to a foreground prompt: stop reading, restore cooked.
+
+        REF-COUNTED: a nested suspend (a child venue / ask_user opened inside an
+        already-suspended prompt) only increments the depth; the real listener
+        pause and termios switch happen on the outermost 0 -> 1 transition.
+        """
+        self._suspend_depth += 1
+        if self._suspend_depth > 1:
+            return
         if self.listener is not None:
             self.listener.suspend()
         if self._term_orig is not None and self._cbreak:
@@ -244,7 +268,15 @@ class StdinInterruptController:
             self._cbreak = False
 
     def resume(self):
-        """Take stdin back after a prompt: restore cbreak, resume reading."""
+        """Take stdin back after a prompt: restore cbreak, resume reading.
+
+        REF-COUNTED: only the OUTERMOST resume (1 -> 0) really restores the
+        listener, so an inner frame's exit cannot release an outer hold.
+        """
+        if self._suspend_depth > 0:
+            self._suspend_depth -= 1
+        if self._suspend_depth > 0:
+            return
         if self.listener is not None:
             self.listener.resume()
         if self._term_orig is not None and not self._cbreak:
