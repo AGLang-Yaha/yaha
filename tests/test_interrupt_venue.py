@@ -25,6 +25,7 @@ from unittest.mock import patch
 
 from yaha.core.agent import Agent, VenueResult
 from yaha.core import interrupt_commands as ic
+from yaha.core.md_loader import MarkdownLoadError
 
 
 class _FakeTTY:
@@ -79,6 +80,10 @@ def _make_agent(lines, llm=None, stage=None):
     agent.context_size = 128000
     agent.compress_count = 0
     agent._last_prompt_tokens = 0
+    agent.agent_classes = {}
+    agent.runtime = None
+    agent.yaha_load_classes = None
+    agent._venue_stack = []
     agent.stdin_interrupt = None
     agent._serving_interrupt = False
     agent._compressing = False
@@ -98,7 +103,7 @@ def _make_agent(lines, llm=None, stage=None):
     agent._interrupt_resume = lambda: None
     agent.llm = llm or _ScriptedLLM(['a model answer'])
     box = list(lines)
-    printed = {'answers': [], 'help': [], 'status': [], 'notes': [], 'warnings': [], 'info': []}
+    printed = {'answers': [], 'help': [], 'status': [], 'notes': [], 'warnings': [], 'info': [], 'list': []}
     agent.ui = types.SimpleNamespace(
         interrupt_banner=lambda *a, **k: None,
         interrupt_read=lambda *a, **k: (box.pop(0) if box else None),
@@ -107,6 +112,7 @@ def _make_agent(lines, llm=None, stage=None):
         interrupt_status=lambda *a, **k: printed['status'].append(a[-1]),
         interrupt_note=lambda *a, **k: printed['notes'].append(a[-1]),
         interrupt_info=lambda *a, **k: printed['info'].append(a[-1]),
+        interrupt_list=lambda *a, **k: printed['list'].append((a[-3], a[-2], a[-1])),
         display_warning=lambda *a, **k: printed['warnings'].append(a[-1]),
         spinner=lambda *a, **k: contextlib.nullcontext(),
     )
@@ -604,6 +610,287 @@ class InterruptDebugCommandsTests(unittest.TestCase):
         self.assertEqual(result.status, ic.STATUS_RESUME)
         self.assertEqual(agent.llm.calls, [])
         self.assertEqual(agent.history, history)
+
+
+class InterruptListLoadHistoryTests(unittest.TestCase):
+    '''New venue commands: /list agents, /list instance, /load, /history [ID].'''
+
+    def _class_cfg(self, code='X', model='m', description='', system_prompt=''):
+        return types.SimpleNamespace(code=code, model=model,
+                                     description=description, system_prompt=system_prompt)
+
+    def _handle(self, name, cls, aid, status='ready', wait=None,
+                ratio=0.0, window=100000, broken=False):
+        if broken:
+            peer = types.SimpleNamespace(
+                config=types.SimpleNamespace(name=cls), agent_id=aid,
+                context_size=window)
+        else:
+            peer = types.SimpleNamespace(
+                config=types.SimpleNamespace(name=cls), agent_id=aid,
+                context_size=window, _context_usage_ratio=lambda: ratio)
+        return types.SimpleNamespace(name=name, status=status,
+                                     wait_event=wait, agent=peer)
+
+    def _runtime(self, pool, active='main', max_agents=None):
+        return types.SimpleNamespace(
+            pool=pool, active_name=lambda: active,
+            max_agents=max_agents if max_agents is not None else len(pool))
+
+    # --- table / help -----------------------------------------------------
+
+    def test_table_lists_new_commands(self):
+        names = [c.name for c in ic.INTERRUPT_COMMANDS]
+        for n in ('list', 'load'):
+            self.assertIn(n, names)
+        spec = ic.lookup('list')
+        self.assertEqual(spec.kind, ic.KIND_LOOP)
+        self.assertEqual(spec.arg, ic.ARG_REQUIRED)
+        self.assertEqual(spec.status, '')
+
+    def test_help_lists_new_usage(self):
+        menu = ic.render_help()
+        self.assertIn('/list <instance|agents>', menu)
+        self.assertIn('/load <path>', menu)
+        self.assertIn('/history [ID] [page-size]', menu)
+
+    def test_parse_new_commands(self):
+        spec, arg = ic.parse_interrupt_line('/list agents')
+        self.assertIsNotNone(spec)
+        self.assertEqual((spec.name, arg), ('list', 'agents'))
+        spec, arg = ic.parse_interrupt_line('/load /x/y.md')
+        self.assertEqual((spec.name, arg), ('load', '/x/y.md'))
+
+    # --- /list agents -----------------------------------------------------
+
+    def test_list_agents_rows(self):
+        agent = _make_agent(['/list agents', '/resume'])
+        agent.agent_classes = {
+            'BaseAgent': self._class_cfg(code='Base', model='m1', description='root class'),
+            'NoAgent': self._class_cfg(code='No', model='m2', description='no-op'),
+        }
+        _run_venue(agent)
+        self.assertTrue(agent._printed['list'])
+        title, items, columns = agent._printed['list'][0]
+        self.assertEqual(title, 'Agent Classes')
+        self.assertEqual(columns, ['Name', 'Code', 'Model', 'Description'])
+        self.assertEqual(len(items), 2)
+        joined = ' '.join(str(x) for row in items for x in row)
+        self.assertIn('BaseAgent', joined)
+        self.assertIn('NoAgent', joined)
+        self.assertIn('root class', joined)
+
+    def test_list_agents_description_fallback(self):
+        agent = _make_agent(['/list agents', '/resume'])
+        agent.agent_classes = {
+            'X': self._class_cfg(description='', system_prompt='first line here\nsecond'),
+        }
+        _run_venue(agent)
+        title, items, columns = agent._printed['list'][0]
+        self.assertIn('first line here', str(items[0]))
+
+    def test_list_agents_marks_current(self):
+        agent = _make_agent(['/list agents', '/resume'])
+        agent.agent_classes = {'TestAgent': self._class_cfg()}
+        _run_venue(agent)
+        title, items, columns = agent._printed['list'][0]
+        self.assertIn('(current)', str(items[0][0]))
+
+    def test_list_agents_empty(self):
+        agent = _make_agent(['/list agents', '/resume'])
+        agent.agent_classes = {}
+        _run_venue(agent)
+        title, items, columns = agent._printed['list'][0]
+        self.assertEqual(items, [])
+        self.assertEqual(agent.llm.calls, [])
+
+    # --- /list instance ---------------------------------------------------
+
+    def test_list_instances_rows(self):
+        agent = _make_agent(['/list instance', '/resume'])
+        agent.runtime = self._runtime({
+            'main': self._handle('main', 'TestAgent', 'abc123', status='running'),
+            'agent-1': self._handle('agent-1', 'NoAgent', 'def456',
+                                    status='waiting', wait='review_done'),
+        })
+        _run_venue(agent)
+        self.assertTrue(agent._printed['list'])
+        title, items, columns = agent._printed['list'][0]
+        self.assertEqual(
+            columns, ['Instance', 'Class', 'ID', 'Status', 'Wait Event', 'Context'])
+        self.assertEqual(len(items), 2)
+        joined = str(items)
+        self.assertIn('agent-1', joined)
+        self.assertIn('review_done', joined)
+        self.assertIn('NoAgent', joined)
+
+    def test_list_instances_context_pct(self):
+        agent = _make_agent(['/list instance', '/resume'])
+        agent.runtime = self._runtime({
+            'main': self._handle('main', 'TestAgent', 'abc123', ratio=0.25, window=100000),
+        })
+        _run_venue(agent)
+        title, items, columns = agent._printed['list'][0]
+        cell = items[0][5]
+        self.assertIn('25%', cell)
+        self.assertIn('25000/100000', cell)
+
+    def test_list_instances_no_runtime(self):
+        agent = _make_agent(['/list instance', '/resume'])
+        agent.runtime = None
+        _run_venue(agent)
+        self.assertTrue(agent._printed['list'])
+        self.assertTrue(any('single agent' in t for t in agent._printed['info']))
+        title, items, columns = agent._printed['list'][0]
+        self.assertTrue(items)
+
+    def test_list_instances_broken_peer(self):
+        agent = _make_agent(['/list instance', '/resume'])
+        agent.runtime = self._runtime({
+            'bad': self._handle('bad', 'X', 'id1', broken=True),
+        })
+        _run_venue(agent)
+        title, items, columns = agent._printed['list'][0]
+        self.assertEqual(items[0][5], '-')
+
+    def test_list_instances_read_only(self):
+        agent = _make_agent(['/list instance', '/resume'])
+        before = list(agent.history)
+        agent.runtime = None
+        _run_venue(agent)
+        self.assertEqual(agent.history, before)
+        self.assertEqual(agent.llm.calls, [])
+
+    # --- /list argument handling ------------------------------------------
+
+    def test_list_unknown_subcommand_warns(self):
+        agent = _make_agent(['/list bogus', '/resume'])
+        result = _run_venue(agent)
+        self.assertEqual(result.status, ic.STATUS_RESUME)
+        self.assertTrue(any('Usage: /list' in w for w in agent._printed['warnings']))
+
+    def test_list_missing_arg_warns(self):
+        agent = _make_agent(['/list', '/resume'])
+        result = _run_venue(agent)
+        self.assertEqual(result.status, ic.STATUS_RESUME)
+        self.assertTrue(agent._printed['warnings'])
+        self.assertEqual(agent.llm.calls, [])
+
+    # --- /load ------------------------------------------------------------
+
+    def test_load_calls_callback_and_reports(self):
+        agent = _make_agent(['/load /tmp/extra.md', '/resume'])
+        seen = []
+
+        def loader(path):
+            seen.append(path)
+            return 'load: /tmp/extra.md\nadded: 1  NewAgent\nclasses now: 3'
+
+        agent.yaha_load_classes = loader
+        _run_venue(agent)
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(any('classes now: 3' in t for t in agent._printed['info']))
+
+    def test_load_missing_file_warns(self):
+        agent = _make_agent(['/load /nope/missing.md', '/resume'])
+        agent.yaha_load_classes = lambda p: 'load: file not found: %s' % p
+        result = _run_venue(agent)
+        self.assertEqual(result.status, ic.STATUS_RESUME)
+        self.assertTrue(any('not found' in w for w in agent._printed['warnings']))
+
+    def test_load_parse_error_warns(self):
+        agent = _make_agent(['/load /tmp/bad.md', '/resume'])
+
+        def boom(path):
+            raise MarkdownLoadError('boom')
+
+        agent.yaha_load_classes = boom
+        result = _run_venue(agent)
+        self.assertEqual(result.status, ic.STATUS_RESUME)
+        self.assertTrue(any('load failed' in w for w in agent._printed['warnings']))
+
+    def test_load_unavailable_warns(self):
+        agent = _make_agent(['/load /tmp/x.md', '/resume'])
+        agent.yaha_load_classes = None
+        _run_venue(agent)
+        self.assertTrue(any('not available' in w for w in agent._printed['warnings']))
+
+    def test_load_requires_arg(self):
+        agent = _make_agent(['/load', '/resume'])
+        result = _run_venue(agent)
+        self.assertEqual(result.status, ic.STATUS_RESUME)
+        self.assertTrue(agent._printed['warnings'])
+
+    def test_load_read_only_history(self):
+        agent = _make_agent(['/load /tmp/x.md', '/resume'])
+        before = list(agent.history)
+        agent.yaha_load_classes = lambda p: 'load: ok'
+        _run_venue(agent)
+        self.assertEqual(agent.history, before)
+
+    # --- /history [ID] ----------------------------------------------------
+
+    def _peer_agent(self, aid='def456', history=None):
+        return types.SimpleNamespace(
+            agent_id=aid,
+            history=history or [{'role': 'user', 'content': 'peer msg'}],
+            config=types.SimpleNamespace(name='NoAgent'))
+
+    def _peer_runtime(self, peer, name='agent-1'):
+        return types.SimpleNamespace(
+            pool={name: types.SimpleNamespace(
+                name=name, agent=peer, status='waiting', wait_event='e')},
+            active_name=lambda: '', max_agents=1)
+
+    def test_history_default_is_own(self):
+        agent = _make_agent(['/history', 'q', '/resume'])
+        agent.history = [{'role': 'system', 'content': 'sys'},
+                         {'role': 'user', 'content': 'mine'}]
+        _run_venue(agent)
+        self.assertTrue(any('mine' in t for t in agent._printed['info']))
+
+    def test_history_by_instance_name(self):
+        agent = _make_agent(['/history agent-1', 'q', '/resume'])
+        peer = self._peer_agent(history=[{'role': 'user', 'content': 'peer msg'}])
+        agent.runtime = self._peer_runtime(peer)
+        _run_venue(agent)
+        self.assertTrue(any('peer msg' in t for t in agent._printed['info']))
+
+    def test_history_by_agent_id(self):
+        agent = _make_agent(['/history def456', 'q', '/resume'])
+        peer = self._peer_agent(aid='def456', history=[{'role': 'user', 'content': 'peer msg'}])
+        agent.runtime = self._peer_runtime(peer)
+        _run_venue(agent)
+        self.assertTrue(any('peer msg' in t for t in agent._printed['info']))
+
+    def test_history_id_and_page_size(self):
+        agent = _make_agent(['/history agent-1 5', 'q', '/resume'])
+        hist = [{'role': 'user', 'content': 'm%d' % i} for i in range(24)]
+        peer = self._peer_agent(history=hist)
+        agent.runtime = self._peer_runtime(peer)
+        _run_venue(agent)
+        pages = [t.split('page ')[1].split('/')[0]
+                 for t in agent._printed['info'] if 'page ' in t]
+        self.assertEqual(pages[0], '5')
+
+    def test_history_numeric_is_page_size(self):
+        agent = _make_agent(['/history 20', 'q', '/resume'])
+        agent.history = [{'role': 'user', 'content': 'm%d' % i} for i in range(25)]
+        _run_venue(agent)
+        self.assertTrue(any('page ' in t for t in agent._printed['info']))
+
+    def test_history_unknown_id_warns(self):
+        agent = _make_agent(['/history nope', 'q', '/resume'])
+        _run_venue(agent)
+        self.assertTrue(any('No agent matches' in w for w in agent._printed['warnings']))
+
+    def test_history_other_agent_read_only(self):
+        agent = _make_agent(['/history agent-1', 'q', '/resume'])
+        peer = self._peer_agent()
+        before = list(peer.history)
+        agent.runtime = self._peer_runtime(peer)
+        _run_venue(agent)
+        self.assertEqual(peer.history, before)
 
 
 if __name__ == '__main__':

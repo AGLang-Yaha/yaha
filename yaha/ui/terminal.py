@@ -655,6 +655,24 @@ class YAHAUI:
         self.console.print(str(text))
         self.console.print()
 
+    def interrupt_list(self, agent_name, agent_id, title, items, columns=None):
+        """Print a titled read-only table under an interrupt rule (venue /list)."""
+        self._interrupt_rule(agent_name, agent_id, str(title), 'bold blue')
+        rows = list(items or [])
+        if not rows:
+            self.console.print('(none)', style='yellow')
+            self.console.print()
+            return
+        from rich.table import Table
+        table = Table(box=MINIMAL, expand=True)
+        for col in (columns or ['Name']):
+            table.add_column(str(col), style='cyan')
+        for row in rows:
+            cells = row if isinstance(row, (list, tuple)) else [row]
+            table.add_row(*[self._fit_text(str(c), max_lines=3) for c in cells])
+        self.console.print(table)
+        self.console.print()
+
     def interrupt_note(self, agent_name, agent_id, text):
         """Print a plain one-line note, e.g. the /resume confirmation."""
         self.console.print(str(text))
