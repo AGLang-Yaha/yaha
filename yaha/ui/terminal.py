@@ -618,13 +618,16 @@ class YAHAUI:
         self.console.print(str(text))
         self.console.print()
 
-    def interrupt_read(self, prompt="> "):
+    def interrupt_read(self, prompt="! "):
         """Read one venue line.
 
         Returns None on EOF / Ctrl-D / Ctrl-C so the venue can leave by
         resuming instead of blocking. Raw text is returned unstripped; the
         caller normalizes it. The prompt is plain text so readline (which owns
         the cursor) can measure it correctly.
+
+        The venue uses a `!` prompt char (default `"! "`) so it is
+        visually distinct from the normal `"> "` ask_user prompt.
         """
         try:
             return input(prompt)
