@@ -233,6 +233,55 @@ class YAHAEngine:
         # in-place /load mutation is visible to every agent and future spawn.
         agent.agent_classes = self.agent_classes
 
+        def spawn_frame_impl(agent_class, runtime=None):
+            """BUILD (but do not run) a child agent for a venue /spawn frame.
+
+            Mirrors `spawn_agent_impl`'s authorization and the toolset
+            privilege cap, but returns the child instead of running it: the
+            venue pushes a frame, enters the child's own venue, and only runs
+            it when the operator issues /resume. When a runtime is supplied the
+            child's parallel spawner is wired, so it may start peers.
+            """
+            target_class = agent_class
+            if str(target_class).lower() == "inherited":
+                target_class = agent_config.name
+
+            authorized = False
+            if target_class in agent_config.agentset:
+                authorized = True
+            else:
+                for name in agent_config.agentset:
+                    cfg = self.agent_classes.get(name)
+                    if cfg and cfg.code == target_class:
+                        authorized = True
+                        break
+            if not authorized and target_class != agent_config.name:
+                return ("Error: Agent class '%s' is not authorized for this agent. "
+                        "Authorized: %s or 'Inherited'."
+                        % (agent_class, agent_config.agentset))
+
+            child_config = self._resolve_agent_class(target_class)
+            if child_config is None:
+                return "Error: Agent class '%s' not found." % agent_class
+            unauthorized = [t for t in child_config.toolset
+                            if t not in agent_config.toolset]
+            if unauthorized:
+                return ("Error: Sub-agent '%s' requested unauthorized tools: %s. "
+                        "Sub-agents cannot have broader privileges than their parents."
+                        % (child_config.name, unauthorized))
+
+            child = self._make_agent(child_config, caller_id=agent.agent_id,
+                                     recursion_depth=recursion_depth + 1)
+            if runtime is not None:
+                # Give the child its runtime, exactly as _spawn_parallel_agent
+                # does, so the venue's /resume drives it through the scoped
+                # run_group instead of the synchronous fallback.
+                child.runtime = runtime
+                self._wire_parallel_spawner(child, child_config, runtime)
+            return child
+
+        agent.yaha_spawn_frame = spawn_frame_impl
+
         def google_search_impl(query):
             from ..llm.gemini import GeminiProvider
             from ..config.models import ModelConfig

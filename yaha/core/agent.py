@@ -416,6 +416,9 @@ class Agent:
         # Engine-wired callback for the venue /load command (dynamic Agent
         # Class loading); None when the agent was not built by YAHAEngine.
         self.yaha_load_classes = None
+        # Engine-wired factory for the venue /spawn command (a build-only child
+        # agent for a push/pop venue frame); None in tests / nested contexts.
+        self.yaha_spawn_frame = None
         self._serving_interrupt = False
         # Stage hooks (preenter/pretool/posttool/preexit). Lazily created on the
         # first hook of a stage; a class that declares no hooks never allocates
@@ -2400,16 +2403,6 @@ class Agent:
             return f'error running detached stage {stage_name}: {e}'
         return None
 
-    def _run_spawn_interrupt(self, agent_class, task_text):
-        spawn = getattr(self, 'yaha_spawn_agent', None)
-        if spawn is None:
-            return None
-        try:
-            result = spawn(system=self.soul_prompt or '', instruction=str(task_text or ''), agent_class=agent_class)
-            return str(result)[:400]
-        except Exception as e:
-            return f'error spawning {agent_class}: {e}'
-
     def _resolve_stage_index(self, chain, target):
         """Return index of attached stage whose name matches target, else None."""
         if target is None:
@@ -2736,6 +2729,22 @@ class Agent:
             rows.append((hname, cls, aid, status, wait, self._context_cell(agent)))
             seen.add(aid)
             seen.add(hname)
+        # Pushed venue frames (the /spawn stack) that are not yet in the pool.
+        for frame in list(getattr(self, '_venue_stack', []) or []):
+            if not isinstance(frame, dict):
+                continue
+            agent = frame.get('agent')
+            if agent is None:
+                continue
+            aid = str(getattr(agent, 'agent_id', '') or '?')
+            if aid in seen:
+                continue
+            cls = str(getattr(getattr(agent, 'config', None), 'name', '') or '?')
+            handle = frame.get('handle')
+            status = 'spawned' if not handle else 'running'
+            rows.append((str(frame.get('name') or aid), cls, aid, status, '-',
+                         self._context_cell(agent)))
+            seen.add(aid)
         # Always include the venue's own agent, even without a runtime.
         if self.agent_id not in seen:
             rows.append((
@@ -2801,29 +2810,195 @@ class Agent:
             return
         self.ui.interrupt_info(name, agent_id, 'Interrupt Load', text)
 
-    def _venue_spawn(self, arg):
-        """Spawn a sub-agent from the venue and show its output."""
-        agent_class, _, task_text = str(arg).partition(' ')
-        digest = self._run_spawn_interrupt(agent_class, task_text)
-        if not digest:
-            self.ui.display_warning(
-                self.config.name, self.agent_id, 'Spawn produced no output.'
-            )
-            return
-        self.ui.interrupt_answer(self.config.name, self.agent_id, digest)
+    def _venue_spawn_frame(self, arg, frames):
+        """`/spawn <Class> <task>`: push a frame and enter the child's venue.
 
-    def _serve_interrupt_venue(self, stage, stage_turn, tools_called, entry='loop'):
+        The child is CREATED but not run: a `/resume` inside its venue runs it.
+        On return the frame is popped (in a finally, so an exception cannot leave
+        a stale frame) and control returns to this venue.
+        """
+        name = self.config.name
+        agent_id = self.agent_id
+        agent_class, _, task_text = str(arg).partition(' ')
+        agent_class = agent_class.strip()
+        task_text = task_text.strip()
+        if not agent_class:
+            self.ui.display_warning(name, agent_id, 'Usage: /spawn <AgentClass> <task>')
+            return
+        factory = getattr(self, 'yaha_spawn_frame', None)
+        if factory is None:
+            self.ui.display_warning(name, agent_id, 'spawning is not available in this context')
+            return
+        runtime = getattr(self, 'runtime', None)
+        try:
+            child = factory(agent_class, runtime)
+        except Exception as exc:
+            self.ui.display_warning(name, agent_id, 'spawn failed: %s' % exc)
+            return
+        if child is None or isinstance(child, str):
+            self.ui.display_warning(name, agent_id, str(child or 'spawn produced no child'))
+            return
+        frame = {
+            'agent': child,
+            'task': task_text,
+            'handle': None,
+            'name': '%s/%s' % (getattr(child.config, 'name', agent_class), child.agent_id),
+        }
+        frames.append(frame)
+        try:
+            self.ui.interrupt_note(
+                name, agent_id,
+                'pushed frame %d: %s (%s); /resume runs it, /quit pops it.'
+                % (len(frames), frame['name'], agent_class))
+            child._serve_interrupt_venue(
+                {'name': 'Spawned'}, 0, set(), entry='spawn',
+                frames=frames, spawned=True)
+        finally:
+            if frames and frames[-1] is frame:
+                frames.pop()
+        self.ui.interrupt_note(name, agent_id, 'popped frame: %s' % frame['name'])
+
+    @staticmethod
+    def _venue_group_waits(runtime, handle_name):
+        """The parked event name(s) for a frame's runtime group, or ''."""
+        waiting = getattr(runtime, 'waiting', None) or {}
+        names = []
+        for event, handles in waiting.items():
+            for handle in handles:
+                if getattr(handle, 'name', None) == handle_name:
+                    names.append(str(event))
+        return ', '.join(sorted(set(names)))
+
+    def _run_spawned_frame(self, frames, steer=None):
+        """Run the CURRENT spawned frame's child; return True to POP the frame.
+
+        With a runtime the child (and any parallel peers it starts) is driven by
+        the scoped `runtime.run_group`; a completed group pops the frame, a
+        channel-block keeps it (never a deadlock). Without a runtime the child
+        runs synchronously.
+        """
+        name = self.config.name
+        agent_id = self.agent_id
+        frame = frames[-1] if frames else None
+        task = ''
+        if isinstance(frame, dict):
+            task = str(frame.get('task') or '')
+        steer_text = str(steer or '').strip()
+        if steer_text:
+            if task:
+                task = task + chr(10) + chr(10) + 'Operator steer: ' + steer_text
+            else:
+                task = steer_text
+        runtime = getattr(self, 'runtime', None)
+        pool = getattr(runtime, 'pool', None) if runtime is not None else None
+        if runtime is not None and pool is not None:
+            handle = frame.get('_handle') if isinstance(frame, dict) else None
+            if handle is None:
+                try:
+                    handle = runtime.spawn(self, task)
+                except Exception as exc:
+                    self.ui.display_warning(name, agent_id, 'spawn run failed: %s' % exc)
+                    return True
+                if isinstance(frame, dict):
+                    # Retain the OBJECT, not just its name: the runtime removes a
+                    # finished handle from `pool`, but the object still carries
+                    # the child's final `result`.
+                    frame['_handle'] = handle
+                    frame['handle'] = getattr(handle, 'name', None)
+            handle_name = getattr(handle, 'name', None)
+            try:
+                outcome = runtime.run_group([handle_name])
+            except Exception as exc:
+                self.ui.display_warning(name, agent_id, 'group run failed: %s' % exc)
+                return True
+            if outcome == 'empty':
+                result = str(getattr(handle, 'result', '') or '')
+                self.ui.interrupt_note(
+                    name, agent_id,
+                    'spawned %s finished: %s' % (name, result[:400] if result else 'done'))
+                return True
+            waits = self._venue_group_waits(runtime, handle_name)
+            self.ui.interrupt_note(
+                name, agent_id,
+                'frame group blocked on %s; /resume to continue, /quit to pop.'
+                % (waits or 'an event'))
+            return False
+        # No runtime: a plain synchronous nested run.
+        try:
+            with self.ui.spinner('Running spawned %s...' % name):
+                result = self.run(task)
+        except Exception as exc:
+            self.ui.display_warning(name, agent_id, 'spawn run failed: %s' % exc)
+            return True
+        self.ui.interrupt_note(
+            name, agent_id, 'spawned %s finished: %s' % (name, str(result or 'done')[:400]))
+        return True
+
+    def _venue_agent_stack(self, frames):
+        """Render the spawn CALL stack (the venue frames)."""
+        name = self.config.name
+        agent_id = self.agent_id
+        frames = list(frames or [])
+        if not frames:
+            self.ui.interrupt_info(
+                name, agent_id, 'Agent Stack',
+                'no spawn frames - root only (%s/%s)' % (name, agent_id))
+            return
+        runtime = getattr(self, 'runtime', None)
+        rows = []
+        for idx, frame in enumerate(frames):
+            agent = frame.get('agent') if isinstance(frame, dict) else None
+            fname = str((frame.get('name') if isinstance(frame, dict) else None) or '?')
+            cls = str(getattr(getattr(agent, 'config', None), 'name', '') or '?')
+            aid = str(getattr(agent, 'agent_id', '') or '?')
+            handle = frame.get('handle') if isinstance(frame, dict) else None
+            is_root = bool(frame.get('root')) if isinstance(frame, dict) else False
+            if is_root:
+                state = 'root'
+            elif handle:
+                state = 'handle:' + str(handle)
+            else:
+                state = 'pending'
+            waits = self._venue_group_waits(runtime, handle) if handle else ''
+            cell = fname + (' <- current' if idx == len(frames) - 1 else '')
+            rows.append((str(idx + 1), cell, cls, aid, state, waits or '-'))
+        if len(rows) <= 1:
+            head = 'spawn stack: root only (no spawn frames)'
+        else:
+            head = 'spawn stack: %d frame(s) (1 = root, top is current)' % len(rows)
+        self.ui.interrupt_info(name, agent_id, 'Agent Stack', head)
+        self.ui.interrupt_list(
+            name, agent_id, 'Frames', rows,
+            ['#', 'Frame', 'Class', 'ID', 'State', 'Wait'])
+
+    def _serve_interrupt_venue(self, stage, stage_turn, tools_called, entry='loop',
+                               frames=None, spawned=False):
         """Run the interrupt diagnose venue until a flow command is chosen.
 
         The venue is a REPL: a line WITHOUT a leading slash is a question to the
         model and never changes the chain; only a slash command changes the
         execution flow. Returns a VenueResult.
+
+        `frames` is the shared spawn STACK: the root call seeds it with a root
+        frame, and every `/spawn`ed child venue is entered with the SAME list, so
+        nested frames form one stack. `spawned` marks a child call: there `/quit`
+        POPS (returns STATUS_POP) instead of ending the chain, and `/resume` runs
+        the frame's child.
         """
         if not sys.stdin.isatty():
             # Non-TTY / unattended: never block and never call the model.
             return VenueResult(ic.STATUS_RESUME, None, None)
+        if frames is None:
+            frames = [{
+                'agent': self,
+                'task': getattr(self, 'current_task_prompt', '') or '',
+                'handle': None,
+                'name': '%s/%s' % (self.config.name, self.agent_id),
+                'root': True,
+            }]
         self._serving_interrupt = True
         self._venue_entry = entry
+        self._venue_stack = frames
         self._interrupt_suspend()
         transcript = []
         name = self.config.name
@@ -2834,7 +3009,10 @@ class Agent:
             while True:
                 raw = self.ui.interrupt_read()
                 if raw is None:
-                    # EOF / Ctrl-D is an explicit act: leave by resuming.
+                    # EOF / Ctrl-D is an explicit act: pop a child frame, or
+                    # resume at the root frame.
+                    if spawned:
+                        return VenueResult(ic.STATUS_POP, None, None)
                     return VenueResult(ic.STATUS_RESUME, None, None)
                 line = str(raw).strip()
                 if not line:
@@ -2870,7 +3048,10 @@ class Agent:
                     self._venue_call(arg)
                     continue
                 if spec.name == 'spawn':
-                    self._venue_spawn(arg)
+                    self._venue_spawn_frame(arg, frames)
+                    continue
+                if spec.name == 'agent_stack':
+                    self._venue_agent_stack(frames)
                     continue
                 if spec.name == 'history':
                     self._venue_history_browser(arg)
@@ -2893,7 +3074,21 @@ class Agent:
                     self._venue_load(arg)
                     continue
 
+                if spawned and spec.name in ('rewind', 'restart', 'jump'):
+                    # Chain moves would otherwise fall through to the generic
+                    # return and be discarded while the frame still pops.
+                    self.ui.display_warning(
+                        name, agent_id,
+                        "'/%s' is not available inside a spawned frame; "
+                        "/quit to return first." % spec.name)
+                    continue
                 if spec.name == 'resume':
+                    if spawned:
+                        # A spawned frame's /resume RUNS its child; a completed
+                        # group then pops the frame back to the parent venue.
+                        if self._run_spawned_frame(frames, arg):
+                            return VenueResult(ic.STATUS_POP, None, None)
+                        continue
                     self.ui.interrupt_note(
                         name, agent_id,
                         f"Resuming stage '{stage_name}' at turn {self._current_turn}.",
@@ -2902,6 +3097,10 @@ class Agent:
                 if spec.name == 'jump':
                     return VenueResult(ic.STATUS_JUMP + ':' + str(arg), arg, None)
                 if spec.name == 'quit':
+                    if spawned:
+                        # A child frame's /quit POPS one frame; only the root
+                        # frame routes to the fail target and finishes the run.
+                        return VenueResult(ic.STATUS_POP, None, None)
                     return VenueResult(ic.STATUS_FAIL + ':' + self._quit_target(stage), arg, None)
                 return VenueResult(spec.status, arg, None)
         finally:

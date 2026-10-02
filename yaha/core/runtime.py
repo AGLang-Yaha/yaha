@@ -549,6 +549,51 @@ class AgentRuntime:
             return root_handle.result
         return None
 
+    def run_group(self, names):
+        """Drive ONLY the named handles (plus peers they start) to a stop point.
+
+        A venue `/spawn` frame owns a GROUP of coroutines: the spawned agent and
+        any parallel peers it starts. This is a SCOPED driver - it steps only
+        handles that belong to the group, so the caller (itself parked in its own
+        `_step`) is never disturbed. A handle SPAWNED during the drive joins the
+        group, because it is new to `self.pool` since entry, so a member's
+        parallel peers are driven too.
+
+        Returns:
+          'empty'   - no live handle remains in the group;
+          'blocked' - members remain but none is READY (they wait on an event,
+                      which may be a message channel the operator will answer).
+
+        It NEVER runs the deadlock detector: a group that waits on a message
+        channel (endpoint / async job) is a NORMAL pause, so the operator can
+        keep waiting or inspect it instead of the run being aborted.
+        """
+        known = set(self.pool)
+        group = set(str(n) for n in (names or ()))
+        while True:
+            # Foreign-thread wakes become ready handles on the scheduler thread.
+            self._drain_endpoint_notifications()
+            self._drain_job_notifications()
+            # Adopt peers a member started during this drive.
+            for name in list(self.pool):
+                if name not in known:
+                    group.add(name)
+            live = [n for n in group if n in self.pool]
+            if not live:
+                return 'empty'
+            ready = [h for h in self.ready if h.name in group]
+            if ready:
+                handle = ready[0]
+                try:
+                    self.ready.remove(handle)
+                except ValueError:
+                    continue
+                self._step(handle)
+                continue
+            # Nothing in the group is ready: members wait on some event. This is
+            # a normal pause - report it, never claim a deadlock.
+            return 'blocked'
+
     def _step(self, handle):
         """Advance one agent up to its next stage boundary."""
         handle.status = RUNNING
