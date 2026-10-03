@@ -2649,7 +2649,7 @@ class Agent:
         lines.append('detached: ' + (', '.join(detached) if detached else 'none'))
         return chr(10).join(lines)
 
-    def _venue_compress(self, stage):
+    def _venue_compress(self, stage, level=None):
         """Force an immediate context compression and report the outcome."""
         name = self.config.name
         agent_id = self.agent_id
@@ -2657,16 +2657,44 @@ class Agent:
         before_count = self.compress_count
         stage_prompt = getattr(self, '_current_stage_prompt', '') or ''
         try:
-            rebuilt, _ = self._mid_loop_protection(
-                stage or {}, stage_prompt, self._current_turn, force=True)
+            if level == 1:
+                rebuilt, _ = self._force_l1_only()
+            elif level == 2:
+                rebuilt, _ = self._mid_loop_protection(
+                    stage or {}, stage_prompt, self._current_turn,
+                    force=True, force_l2=True)
+            else:
+                rebuilt, _ = self._mid_loop_protection(
+                    stage or {}, stage_prompt, self._current_turn, force=True)
         except Exception as exc:
             self.ui.display_warning(name, agent_id, 'compression failed: %s' % exc)
             return
         after = int(self._context_usage_ratio() * self.context_size)
-        report = ('compress: ~%d -> ~%d tokens (est.), delta ~%d, rebuilt=%s, count %d -> %d'
-                  % (before, after, before - after, bool(rebuilt),
+        suffix = '' if level is None else ' L%d' % level
+        report = ('compress%s: ~%d -> ~%d tokens (est.), delta ~%d, rebuilt=%s, count %d -> %d'
+                  % (suffix, before, after, before - after, bool(rebuilt),
                      before_count, self.compress_count))
         self.ui.interrupt_info(name, agent_id, 'Interrupt Compress', report)
+
+    def _force_l1_only(self):
+        """Forced L1-only compression for the venue `/compress 1`.
+
+        Runs the deterministic truncation of old tool results and NEVER escalates
+        to the L2 cold restart. Returns (False, turn) to match the
+        `_mid_loop_protection` shape (no history rebuild happens).
+        """
+        before = int(self._context_usage_ratio() * self.context_size)
+        truncated = self._truncate_old_tool_results()
+        after = int(self._context_usage_ratio() * self.context_size)
+        if truncated:
+            self.compress_count += 1
+            self._usage_is_predicted = True
+            note = ('L1 forced truncation: compressed %d tool result(s). '
+                    '~%d -> ~%d tokens (est.).' % (truncated, before, after))
+            self.logger.log_compression(note)
+            self.ui.display_compression(self.config.name, self.agent_id,
+                                        before, after, 'L1', self.compress_count)
+        return False, self._current_turn
 
     def _venue_list(self, arg):
         """Dispatch `/list <instance|agents>`."""
@@ -3065,7 +3093,16 @@ class Agent:
                                            self._venue_chain_report(stage))
                     continue
                 if spec.name == 'compress':
-                    self._venue_compress(stage)
+                    level = None
+                    if arg is not None:
+                        token = str(arg).strip()
+                        if token in ('1', '2'):
+                            level = int(token)
+                        else:
+                            self.ui.display_warning(
+                                name, agent_id, 'Usage: ' + ic.usage_of(spec))
+                            continue
+                    self._venue_compress(stage, level)
                     continue
                 if spec.name == 'list':
                     self._venue_list(arg)
@@ -4004,7 +4041,7 @@ class Agent:
                 pass
         return text
 
-    def _mid_loop_protection(self, stage, stage_prompt, turn, force=False):
+    def _mid_loop_protection(self, stage, stage_prompt, turn, force=False, force_l2=False):
         """High-water safety net inside a long-running stage (not Snap boundary).
 
         This is the STRICT net: it fires at HARD_FORCE_RATIO and it fires regardless of
@@ -4016,6 +4053,8 @@ class Agent:
 
         Uses the formal detached handler when the class config has one; otherwise falls
         back to the legacy `_compress_context` so non-snap-policy configs keep working.
+        `force_l2` forces the L2 escalation even when the L1 pass was sufficient
+        (the venue `/compress 2`).
 
         Returns (history_was_rebuilt, turn)."""
         ratio = self._context_usage_ratio()
@@ -4037,7 +4076,7 @@ class Agent:
             handler = (self.config.detached_stages or {}).get(handler_name)
         if not handler:
             # No formal handler/policy: preserve legacy paths/tests.
-            return self._compress_context(stage, stage_prompt, turn)
+            return self._compress_context(stage, stage_prompt, turn, force_l2=force_l2)
 
         # Deterministic L1 truncation first; if that is enough, log it and keep the
         # running stage untouched. The re-check uses the SAME instrument as the trigger
@@ -4045,7 +4084,7 @@ class Agent:
         # switching units mid-decision is what made L1 look sufficient when it was not.
         truncated = self._truncate_old_tool_results()
         after_l1 = self._context_usage_ratio()
-        if self._l1_sufficient(after_l1, bar):
+        if not force_l2 and self._l1_sufficient(after_l1, bar):
             if truncated:
                 self.compress_count += 1
                 after_tokens = int(after_l1 * self.context_size)
@@ -4237,13 +4276,14 @@ class Agent:
             return None, turn
         return digest.strip(), turn
 
-    def _compress_context(self, stage, stage_prompt, turn):
+    def _compress_context(self, stage, stage_prompt, turn, force_l2=False):
         """Two-level compression pipeline for classes WITHOUT a Snap handler.
 
         Run L1 (best-effort truncation), check the configured Snap To target, and only
         escalate to L2 (reflection + cold restart) if L1 alone is not enough. The
         sufficiency decision goes through the shared `_l1_sufficient` helper with the
         target passed explicitly, instead of a hard-coded 0.4. Compression is unlimited.
+        `force_l2` skips the L1-sufficiency gate and always runs L2 (venue `/compress 2`).
 
         Returns (history_was_rebuilt, turn)."""
         self._compressing = True
@@ -4261,7 +4301,7 @@ class Agent:
             # never mistaken for steps.
             steps = self._recent_react_steps(self._compression_keep_steps())
 
-            if self._l1_sufficient(after_l1, target):
+            if not force_l2 and self._l1_sufficient(after_l1, target):
                 self.compress_count += 1
                 self._usage_is_predicted = True
                 note = (f"L1 truncation: compressed {compressed_n} tool result(s). "

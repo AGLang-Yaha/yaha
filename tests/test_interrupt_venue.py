@@ -606,6 +606,35 @@ class InterruptDebugCommandsTests(unittest.TestCase):
         self.assertTrue(calls[0][3])
         self.assertTrue(any('compress:' in t for t in agent._printed['info']))
 
+    def test_compress_level1_runs_l1_only(self):
+        agent = _make_agent(['/compress 1', '/resume'])
+        l1 = []
+        mid = []
+        agent._force_l1_only = lambda: (l1.append(True), (False, 1))[1]
+        agent._mid_loop_protection = lambda *a, **k: (mid.append(True), (False, 1))[1]
+        _run_venue(agent, stage={'name': 'Coding'})
+        self.assertEqual(l1, [True])
+        self.assertEqual(mid, [])
+        self.assertTrue(any('compress L1:' in t for t in agent._printed['info']))
+
+    def test_compress_level2_forces_l2(self):
+        agent = _make_agent(['/compress 2', '/resume'])
+        calls = []
+        agent._mid_loop_protection = lambda stage, prompt, turn, force=False, force_l2=False: (
+            calls.append((force, force_l2)), (False, turn))[1]
+        _run_venue(agent, stage={'name': 'Coding'})
+        self.assertEqual(calls, [(True, True)])
+        self.assertTrue(any('compress L2:' in t for t in agent._printed['info']))
+
+    def test_compress_invalid_level_warns(self):
+        agent = _make_agent(['/compress 3', '/resume'])
+        calls = []
+        agent._force_l1_only = lambda: (calls.append('l1'), (False, 1))[1]
+        agent._mid_loop_protection = lambda *a, **k: (calls.append('mid'), (False, 1))[1]
+        _run_venue(agent, stage={'name': 'Coding'})
+        self.assertEqual(calls, [])
+        self.assertTrue(any('Usage:' in w for w in agent._printed['warnings']))
+
     def test_force_bypasses_the_watermark(self):
         agent = _make_agent(['/resume'])
         agent.history = [{'role': 'system', 'content': 'sys'},
