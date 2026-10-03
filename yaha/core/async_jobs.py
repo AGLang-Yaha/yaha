@@ -64,7 +64,7 @@ class AsyncJob:
 
     __slots__ = ("job_id", "cmdline", "display_cmdline", "owner", "status",
                  "output", "error", "started_at", "finished_at", "delivered",
-                 "proc")
+                 "proc", "finished_event")
 
     def __init__(self, job_id, cmdline, owner=None, display_cmdline=None):
         self.job_id = job_id
@@ -79,6 +79,9 @@ class AsyncJob:
         self.finished_at = None
         self.delivered = False
         self.proc = None
+        # Set by ``finish`` the instant this job reaches a terminal state, so
+        # ``AsyncJobRegistry.wait`` can park a caller without busy-polling.
+        self.finished_event = threading.Event()
 
     def finish(self, status, output="", error=None):
         """Record the terminal state (called once, by the worker thread).
@@ -102,6 +105,9 @@ class AsyncJob:
         self.finished_at = time.monotonic()
         # Terminal status LAST - see PUBLICATION ORDER above.
         self.status = status
+        # Wake any parked waiter only AFTER the terminal status is visible, so
+        # a caller released by the event always reads the finished snapshot.
+        self.finished_event.set()
         return self
 
     def elapsed(self):
@@ -218,6 +224,21 @@ class AsyncJobRegistry:
         """Snapshot of one job, or None when the id is unknown."""
         job = self.get(job_id)
         return job.snapshot() if job is not None else None
+
+    def wait(self, job_id, timeout=None):
+        """Block until the job is terminal, or ``timeout`` seconds elapse.
+
+        Returns the job's snapshot, or None when the id is unknown. A job that
+        already finished returns immediately (its ``finished_event`` is already
+        set). ``timeout=None`` blocks until the job finishes; callers that must
+        not block forever pass a positive number of seconds. A timeout NEVER
+        cancels the job - it simply returns the still-running snapshot.
+        """
+        job = self.get(job_id)
+        if job is None:
+            return None
+        job.finished_event.wait(timeout)
+        return job.snapshot()
 
     def is_live(self, job_id):
         """True while the named job is still running (the deadlock predicate)."""

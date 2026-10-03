@@ -465,8 +465,8 @@ class Agent:
             "list_files": lambda path=".", pattern=None: list_files(path, pattern, access_controller=self.access_controller, ui=self.ui),
             "bash_tool": self._bash_tool_with_guard,
             "async_bash": self._async_bash_tool_with_guard,
-            "poll_async": lambda job_id: poll_async_tool(
-                job_id, registry=self._async_registry()),
+            "poll_async": lambda job_id, timeout=None: poll_async_tool(
+                job_id, registry=self._async_registry(), timeout=timeout),
             "web_fetch_tool": web_fetch_tool,
             "load_skill": lambda name: load_skill(name, session=self.session),
             "yaha_spawn_agent": lambda **kwargs: self.yaha_spawn_agent(**kwargs),

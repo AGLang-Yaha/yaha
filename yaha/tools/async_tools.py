@@ -4,7 +4,8 @@
 """The asynchronous shell-tool family: ``async_bash`` and ``poll_async``.
 
 ``async_bash`` launches a command in the background and returns a waitable job
-id immediately; ``poll_async`` reads that job's status without blocking. The
+id immediately; ``poll_async`` reads that job's status without blocking, or
+-- with a positive ``timeout`` -- parks the caller until it finishes. The
 finished result is ALSO attached to the agent's next message by the
 opportunistic drain in ``Agent._drain_async_results``.
 """
@@ -87,8 +88,38 @@ def async_bash_tool(cmdline, registry, access_controller=None,
             + " also attached automatically to your next message.")
 
 
-def poll_async_tool(job_id, registry):
-    """Non-blocking status/result read for one async job.
+def _coerce_wait_seconds(timeout):
+    """Normalize a poll_async timeout into (seconds, error).
+
+    None means do not wait (the historical behaviour) and yields
+    (None, None). A number, or a numeric string, is clamped to
+    [0, JOB_TIMEOUT_S]: zero or negative means do not wait, and the cap
+    matches the longest a single async job can run. A non-numeric value is a
+    loud error, never a silent zero.
+    """
+    if timeout is None:
+        return None, None
+    try:
+        seconds = float(timeout)
+    except (TypeError, ValueError):
+        return None, ("Error: poll_async timeout must be a number of seconds, "
+                      "got " + repr(timeout) + ".")
+    if seconds != seconds:  # NaN is not a usable wait.
+        return None, ("Error: poll_async timeout must be a number of seconds, "
+                      "got " + repr(timeout) + ".")
+    if seconds <= 0:
+        return None, None
+    return min(seconds, float(JOB_TIMEOUT_S)), None
+
+
+def poll_async_tool(job_id, registry, timeout=None):
+    """Status/result read for one async job; optionally park until it ends.
+
+    With no ``timeout`` (or a non-positive one) this is the historical
+    non-blocking snapshot. With a positive ``timeout`` the caller is parked for
+    up to that many seconds (capped at ``JOB_TIMEOUT_S``) and released the
+    moment the job reaches a terminal state; if the wait elapses first the
+    reply says so and the job KEEPS RUNNING - a timeout never cancels it.
 
     Every answer echoes the command the job was started with. The result may
     arrive long after the ``async_bash`` call that launched it, and history
@@ -97,7 +128,13 @@ def poll_async_tool(job_id, registry):
     """
     if registry is None:
         return "Error: poll_async requires a job registry."
-    snapshot = registry.poll(job_id)
+    seconds, error = _coerce_wait_seconds(timeout)
+    if error:
+        return error
+    if seconds:
+        snapshot = registry.wait(job_id, timeout=seconds)
+    else:
+        snapshot = registry.poll(job_id)
     if snapshot is None:
         return "Error: no async job with id " + repr(str(job_id)) + "."
     status = snapshot["status"]
@@ -105,6 +142,10 @@ def poll_async_tool(job_id, registry):
     command = snapshot.get("display_cmdline") or snapshot.get("cmdline") or ""
     header = "ASYNC JOB %s: %s (%.1fs)" % (snapshot["job_id"], status, elapsed)
     if status in (PENDING, RUNNING):
+        if seconds:
+            return (header + "\nCOMMAND: " + command
+                    + "\n(wait timed out after %.1fs; the job is still running "
+                    "and was NOT cancelled)" % seconds)
         return header + "\nCOMMAND: " + command
     body = snapshot["output"] or "(no output)"
     if snapshot.get("error"):
