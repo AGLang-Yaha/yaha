@@ -393,6 +393,8 @@ class YAHAUI:
                 summary = args.get("cmdline", "")
             elif tool_name == "poll_async":
                 summary = args.get("job_id", "")
+                if args.get("timeout"):
+                    summary = "%s (timeout %ss)" % (summary, args["timeout"])
 
             prefix = f"  {tool_name} "
             tool_line = Text(prefix, style="yellow")

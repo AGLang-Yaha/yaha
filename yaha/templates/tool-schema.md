@@ -195,13 +195,17 @@
   },
   {
     "name": "poll_async",
-    "description": "Check the status or result of a background async_bash job by its id, without blocking.",
+    "description": "Check the status or result of a background async_bash job by its id. Without a timeout this returns immediately; with a positive timeout it WAITS (parks you) up to that many seconds for the job to finish, returning the moment it reaches a terminal state. A timeout does NOT cancel the job: if the wait elapses first you get the still-running status and the job keeps going.",
     "parameters": {
       "type": "object",
       "properties": {
         "job_id": {
           "type": "string",
           "description": "The job id returned by async_bash, e.g. async-1."
+        },
+        "timeout": {
+          "type": "number",
+          "description": "Optional seconds to WAIT for the job before returning (capped at 300). Omit or use 0 to return immediately. When the wait elapses the reply says the job is still running; the job is NOT cancelled."
         }
       },
       "required": ["job_id"]
