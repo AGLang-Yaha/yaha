@@ -5,7 +5,7 @@ import os
 from .session import Session
 from .agent import Agent
 from .access import AccessController
-from .md_loader import load_md_with_includes
+from .md_loader import load_md_with_includes, MarkdownLoadError
 from .soulstore import soul_for_class
 from ..config.models import parse_model_md
 from ..config.agents import load_agent_classes
@@ -41,6 +41,10 @@ class YAHAEngine:
         # stay per-file for `-I`.
         agent_class_file = os.path.join(self.yaha_dir, "AgentClass.md")
         include_files = list(include_agent_files or ())
+        # Persist the class-document paths so a venue /load can re-parse the
+        # workspace file plus every accumulated extra file, exactly like -I.
+        self.agent_class_file = agent_class_file
+        self.include_agent_files = include_files
         # ONE read of every document yields both the resolved classes and the
         # definition report the diagnostics below are built from - so a class
         # file (and its includes) is loaded and macro-expanded exactly once.
@@ -72,6 +76,63 @@ class YAHAEngine:
             self.soul_text = load_md_with_includes(soul_path)
             self.soul_prompt = soul_for_class(self.soul_text, None, None)
         
+    def _refresh_class_diagnostics(self):
+        """Recompute the clash / unknown-parent reports after a class reload."""
+        self.class_conflicts = {
+            name: entries for name, entries in self.class_sources.items()
+            if sum(count for _path, count in entries) > 1
+        }
+        self.unknown_parents = [
+            (name, config.inherited)
+            for name, config in self.agent_classes.items()
+            if config.inherited not in (None, "None")
+            and config.inherited not in self.agent_classes
+        ]
+
+    def load_agent_class_document(self, path):
+        """Dynamically load ONE extra Agent Class file (the venue /load command).
+
+        Identical semantics to `-I/--include`: the workspace AgentClass.md plus
+        every accumulated extra file is re-parsed and inheritance re-resolved
+        from scratch, so a class may inherit from the workspace classes and from
+        earlier loaded files. The SHARED `agent_classes` dict is updated IN
+        PLACE, so every already-built agent (which holds the same object) and
+        every future spawn sees the new classes.
+
+        Returns a human-readable report; a missing or unparsable file is
+        reported as text (never raised) so the venue can print it.
+        """
+        raw = str(path or '').strip()
+        if not raw:
+            return 'load: no path given'
+        target = raw if os.path.isabs(raw) else os.path.join(self.workspace_dir, raw)
+        target = os.path.abspath(target)
+        if not os.path.exists(target):
+            return 'load: file not found: %s' % target
+        before = set(self.agent_classes)
+        includes = list(self.include_agent_files)
+        if target not in includes:
+            includes.append(target)
+        try:
+            merged, sources = load_agent_classes(self.agent_class_file, includes)
+        except MarkdownLoadError as exc:
+            return 'load: parse error: %s' % exc
+        if not merged:
+            return 'load: no agent classes found in %s' % target
+        added = sorted(set(merged) - before)
+        updated = sorted(set(merged) & before)
+        self.agent_classes.clear()
+        self.agent_classes.update(merged)
+        self.include_agent_files = includes
+        self.class_sources = sources
+        self._refresh_class_diagnostics()
+        return chr(10).join([
+            'load: %s' % target,
+            'added: %d  %s' % (len(added), ', '.join(added) or '-'),
+            'updated: %d  %s' % (len(updated), ', '.join(updated) or '-'),
+            'classes now: %d' % len(merged),
+        ])
+
     def _stdin_controller(self):
         """The engine's shared stdin/Esc controller (created on demand).
 
@@ -165,6 +226,61 @@ class YAHAEngine:
             )
 
         agent.yaha_spawn_agent = spawn_agent_impl
+        # The venue /load command re-parses the class documents through the
+        # engine (the source of truth for the class-file paths).
+        agent.yaha_load_classes = self.load_agent_class_document
+        # Guarantee the SHARED class map even when it starts empty, so an
+        # in-place /load mutation is visible to every agent and future spawn.
+        agent.agent_classes = self.agent_classes
+
+        def spawn_frame_impl(agent_class, runtime=None):
+            """BUILD (but do not run) a child agent for a venue /spawn frame.
+
+            Mirrors `spawn_agent_impl`'s authorization and the toolset
+            privilege cap, but returns the child instead of running it: the
+            venue pushes a frame, enters the child's own venue, and only runs
+            it when the operator issues /resume. When a runtime is supplied the
+            child's parallel spawner is wired, so it may start peers.
+            """
+            target_class = agent_class
+            if str(target_class).lower() == "inherited":
+                target_class = agent_config.name
+
+            authorized = False
+            if target_class in agent_config.agentset:
+                authorized = True
+            else:
+                for name in agent_config.agentset:
+                    cfg = self.agent_classes.get(name)
+                    if cfg and cfg.code == target_class:
+                        authorized = True
+                        break
+            if not authorized and target_class != agent_config.name:
+                return ("Error: Agent class '%s' is not authorized for this agent. "
+                        "Authorized: %s or 'Inherited'."
+                        % (agent_class, agent_config.agentset))
+
+            child_config = self._resolve_agent_class(target_class)
+            if child_config is None:
+                return "Error: Agent class '%s' not found." % agent_class
+            unauthorized = [t for t in child_config.toolset
+                            if t not in agent_config.toolset]
+            if unauthorized:
+                return ("Error: Sub-agent '%s' requested unauthorized tools: %s. "
+                        "Sub-agents cannot have broader privileges than their parents."
+                        % (child_config.name, unauthorized))
+
+            child = self._make_agent(child_config, caller_id=agent.agent_id,
+                                     recursion_depth=recursion_depth + 1)
+            if runtime is not None:
+                # Give the child its runtime, exactly as _spawn_parallel_agent
+                # does, so the venue's /resume drives it through the scoped
+                # run_group instead of the synchronous fallback.
+                child.runtime = runtime
+                self._wire_parallel_spawner(child, child_config, runtime)
+            return child
+
+        agent.yaha_spawn_frame = spawn_frame_impl
 
         def google_search_impl(query):
             from ..llm.gemini import GeminiProvider

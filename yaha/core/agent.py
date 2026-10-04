@@ -245,6 +245,31 @@ def _validate_tool_call_shape(parsed):
                           'inlined shape with the arguments as siblings of `tool`.'
                           % ', '.join(repr(k) for k in stray))
     return parsed, None
+
+
+def _dsml_attr(attrs, attr):
+    """Read one `name="value"` attribute out of a DSML parameter tag's attrs."""
+    match = re.search(attr + r'\s*=\s*"([^"]*)"', attrs, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def _dsml_coerce(value, string_flag):
+    """Decode a DSML parameter value according to its `string` attribute.
+
+    `string="false"` marks a NON-string parameter (array, number, object): parse
+    it as JSON so the real type survives. Any other marker (`string="true"` or
+    absent) keeps the literal string. A `string="false"` value that does not
+    parse falls back to the raw string, so a malformed payload cannot crash the
+    parser.
+    """
+    if string_flag == "false":
+        try:
+            return json_repair.loads(value)
+        except Exception:
+            return value
+    return value
+
+
 def _parse_dsml_invoke(text):
     """Parse the FIRST DeepSeek DSML tool invoke into {"tool", "args"}.
 
@@ -257,7 +282,8 @@ def _parse_dsml_invoke(text):
         </｜｜DSML｜｜ calls>
 
     An `args` parameter holds the whole argument JSON; otherwise the named
-    parameters are collected into a plain string dict. Returns None when no
+    parameters are collected into a dict, JSON-decoding those marked
+    `string="false"` as non-string. Returns None when no
     usable invoke is present so the caller can keep its normal error path.
     """
     if not text:
@@ -272,21 +298,28 @@ def _parse_dsml_invoke(text):
     close = re.search(r"</" + _DSML_TAG + r"\s*invoke\s*>", text[invoke.end():], re.IGNORECASE)
     body = text[invoke.end():invoke.end() + close.start()] if close else text[invoke.end():]
     params = re.findall(
-        r"<" + _DSML_TAG + r"\s*parameter\s+name=\"([^\"]+)\"[^>]*>(.*?)</" + _DSML_TAG + r"\s*parameter\s*>",
+        r"<" + _DSML_TAG + r"\s*parameter\s+([^>]*)>(.*?)</" + _DSML_TAG + r"\s*parameter\s*>",
         body, re.IGNORECASE | re.DOTALL,
     )
+    named = []
+    for attrs, value in params:
+        pname = _dsml_attr(attrs, "name")
+        if pname is None:
+            continue
+        named.append((pname.strip(), value.strip(),
+                      (_dsml_attr(attrs, "string") or "").strip().lower()))
     args = {}
-    args_blob = next((v for k, v in params if k.strip().lower() == "args"), None)
+    args_blob = next((val for name, val, _flag in named if name.lower() == "args"), None)
     if args_blob is not None:
         try:
-            parsed = json_repair.loads(args_blob.strip())
+            parsed = json_repair.loads(args_blob)
         except Exception:
             return None
         if not isinstance(parsed, dict):
             return None
         args = parsed
     else:
-        args = {k.strip(): v.strip() for k, v in params}
+        args = {name: _dsml_coerce(value, flag) for name, value, flag in named}
     return {"tool": invoke.group(1), "args": args}
 
 
@@ -413,6 +446,12 @@ class Agent:
         # this agent only suspends it around prompts and polls it for Esc.
         self.runtime = None
         self.stdin_interrupt = None
+        # Engine-wired callback for the venue /load command (dynamic Agent
+        # Class loading); None when the agent was not built by YAHAEngine.
+        self.yaha_load_classes = None
+        # Engine-wired factory for the venue /spawn command (a build-only child
+        # agent for a push/pop venue frame); None in tests / nested contexts.
+        self.yaha_spawn_frame = None
         self._serving_interrupt = False
         # Stage hooks (preenter/pretool/posttool/preexit). Lazily created on the
         # first hook of a stage; a class that declares no hooks never allocates
@@ -459,8 +498,8 @@ class Agent:
             "list_files": lambda path=".", pattern=None: list_files(path, pattern, access_controller=self.access_controller, ui=self.ui),
             "bash_tool": self._bash_tool_with_guard,
             "async_bash": self._async_bash_tool_with_guard,
-            "poll_async": lambda job_id: poll_async_tool(
-                job_id, registry=self._async_registry()),
+            "poll_async": lambda job_id, timeout=None: poll_async_tool(
+                job_id, registry=self._async_registry(), timeout=timeout),
             "web_fetch_tool": web_fetch_tool,
             "load_skill": lambda name: load_skill(name, session=self.session),
             "yaha_spawn_agent": lambda **kwargs: self.yaha_spawn_agent(**kwargs),
@@ -800,14 +839,29 @@ class Agent:
         """Pull event names out of a tool call's keyword arguments.
 
         The canonical JSON form carries `names` (a list). The tolerated forms
-        are numbered keys (name1, name2, ...) and a bare `name`. They may be
-        mixed in one call, because the MODEL writes these arguments, not a
-        schema validator.
+        are numbered keys (name1, name2, ...) and a bare `name`. A `names`
+        value that serialized into a JSON array string is decoded back into a
+        list, so a lost `string="false"` marker cannot turn one name into a JSON
+        literal. They may be mixed in one call, because the MODEL writes these
+        arguments, not a schema validator.
         """
         collected = []
         raw = (kwargs or {}).get('names')
         if isinstance(raw, (list, tuple, set)):
             collected.extend(raw)
+        elif isinstance(raw, str) and raw.lstrip().startswith('['):
+            # Defence in depth: a model may pass an already-serialized JSON array
+            # (e.g. a DSML `names` parameter whose `string="false"` marker was
+            # lost). Treat it as the list it clearly is, never as ONE literal
+            # event name - a garbage name would park nobody and deadlock the run.
+            try:
+                decoded = json_repair.loads(raw)
+            except Exception:
+                decoded = None
+            if isinstance(decoded, (list, tuple, set)):
+                collected.extend(decoded)
+            else:
+                collected.append(raw)
         elif raw is not None:
             collected.append(raw)
         numbered = []
@@ -1422,8 +1476,14 @@ class Agent:
             body = job.output or "(no output)"
             if job.error:
                 body = body + chr(10) + "ERROR: " + job.error
+            # Echo the command AS THE AGENT WROTE IT: the result arrives after
+            # the async_bash call that launched it, and compression may have
+            # dropped that call in the meantime. It stays OUTSIDE the fenced
+            # body below, so a command containing fences cannot break it.
+            command = job.display_cmdline or job.cmdline
             result_msg = ("ASYNC BASH RESULT (" + job.job_id + "):" + chr(10)
                           + "- **Status**: " + status + chr(10)
+                          + "- **Command**: " + command + chr(10)
                           + "- **Content**:" + chr(10) + "```" + chr(10)
                           + body + chr(10) + "```")
             self.history.append({"role": "user", "content": result_msg})
@@ -2391,16 +2451,6 @@ class Agent:
             return f'error running detached stage {stage_name}: {e}'
         return None
 
-    def _run_spawn_interrupt(self, agent_class, task_text):
-        spawn = getattr(self, 'yaha_spawn_agent', None)
-        if spawn is None:
-            return None
-        try:
-            result = spawn(system=self.soul_prompt or '', instruction=str(task_text or ''), agent_class=agent_class)
-            return str(result)[:400]
-        except Exception as e:
-            return f'error spawning {agent_class}: {e}'
-
     def _resolve_stage_index(self, chain, target):
         """Return index of attached stage whose name matches target, else None."""
         if target is None:
@@ -2425,26 +2475,30 @@ class Agent:
 
     # --- venue inspection helpers (read-only, model-free) -------------------
 
-    def _venue_history_page(self, page, page_size):
+    def _venue_history_page(self, page, page_size, history=None, label=''):
         """Render one page of the venue history browser.
 
-        Returns (text, page, pages). Pages are ordered oldest -> newest.
+        `history` defaults to this agent's own; `label` names the owner when the
+        pager is showing ANOTHER agent's history. Returns (text, page, pages).
+        Pages are ordered oldest -> newest.
         """
-        total = len(self.history)
+        history = self.history if history is None else history
+        total = len(history)
         try:
             page_size = max(1, min(100, int(page_size)))
         except (TypeError, ValueError):
             page_size = 10
+        owner = ('history of ' + label) if label else 'history'
         if total == 0:
-            return ('history: 0 messages' + chr(10) + 'nav: q=quit', 1, 1)
+            return (owner + ': 0 messages' + chr(10) + 'nav: q=quit', 1, 1)
         pages = (total + page_size - 1) // page_size
         page = max(1, min(int(page), pages))
         start = (page - 1) * page_size
         end = min(total, start + page_size)
-        lines = ['history: %d messages  (page %d/%d)  showing [%d-%d]'
-                 % (total, page, pages, start, end - 1)]
+        lines = ['%s: %d messages  (page %d/%d)  showing [%d-%d]'
+                 % (owner, total, page, pages, start, end - 1)]
         for idx in range(start, end):
-            msg = self.history[idx]
+            msg = history[idx]
             role = str(msg.get('role') or '?')
             body = str(msg.get('content') or '').replace(chr(10), ' ').strip()
             if len(body) > 100:
@@ -2453,23 +2507,110 @@ class Agent:
         lines.append('nav: n=next page  p=prev page  g <page>  d <idx>=detail  q=quit')
         return (chr(10).join(lines), page, pages)
 
+    def _venue_available_ids(self):
+        """A short 'available: ...' list for an unknown-ID warning."""
+        ids = ['%s/%s' % (self.config.name, self.agent_id)]
+        runtime = getattr(self, 'runtime', None)
+        pool = getattr(runtime, 'pool', None) if runtime is not None else None
+        for handle in list((pool or {}).values()):
+            agent = getattr(handle, 'agent', None)
+            aid = str(getattr(agent, 'agent_id', '') or '')
+            hname = str(getattr(handle, 'name', '') or '')
+            if hname or aid:
+                ids.append('%s/%s' % (hname or '?', aid or '?'))
+        for frame in list(getattr(self, '_venue_stack', []) or []):
+            if isinstance(frame, dict) and frame.get('agent') is not None:
+                ids.append('%s/%s' % (frame.get('name') or '?',
+                                      getattr(frame['agent'], 'agent_id', '?')))
+        return 'available: ' + ', '.join(ids)
+
+    def _venue_find_history_target(self, token):
+        """Resolve an /history ID to (agent, label), or None.
+
+        Matches, in order: this agent (by id or class name), a runtime pool
+        handle (by handle name or the agent's id), then a venue frame (by frame
+        name or the agent's id).
+        """
+        want = str(token or '').strip()
+        if not want:
+            return None
+        if want == self.agent_id or want.lower() == str(self.config.name).lower():
+            return (self, '')
+        runtime = getattr(self, 'runtime', None)
+        pool = getattr(runtime, 'pool', None) if runtime is not None else None
+        for handle in list((pool or {}).values()):
+            agent = getattr(handle, 'agent', None)
+            if agent is None:
+                continue
+            hname = str(getattr(handle, 'name', '') or '')
+            aid = str(getattr(agent, 'agent_id', '') or '')
+            if want == hname or (aid and want == aid):
+                return (agent, hname or aid)
+        for frame in list(getattr(self, '_venue_stack', []) or []):
+            if not isinstance(frame, dict):
+                continue
+            agent = frame.get('agent')
+            if agent is None:
+                continue
+            fname = str(frame.get('name', '') or '')
+            aid = str(getattr(agent, 'agent_id', '') or '')
+            if want == fname or (aid and want == aid):
+                return (agent, fname or aid)
+        return None
+
     def _venue_history_browser(self, arg):
-        """Interactive, read-only history pager for the venue /history command."""
+        """Interactive, read-only history pager for the venue /history command.
+
+        Usage: `/history [ID] [page-size]`. With no ID it pages THIS agent's
+        history (unchanged). With an ID it pages the matching agent's history -
+        matched by agent_id or instance/handle name across the runtime pool and
+        the venue frame stack. A lone NUMBER that matches no known ID keeps the
+        historical meaning: a page size for this agent.
+        """
         name = self.config.name
         agent_id = self.agent_id
+        target = self
+        label = ''
         page_size = 10
-        if arg:
+        tokens = str(arg).split() if arg else []
+        size_token = None
+        if len(tokens) == 1:
+            found = self._venue_find_history_target(tokens[0])
+            if found is not None:
+                target, label = found
+            else:
+                try:
+                    int(tokens[0])
+                    size_token = tokens[0]
+                except (TypeError, ValueError):
+                    # Not a known ID and not a number: warn, then fall back to
+                    # THIS agent's own history (the pre-ID /history behaviour).
+                    self.ui.display_warning(
+                        name, agent_id,
+                        "No agent matches ID '%s'. Showing your own history. %s"
+                        % (tokens[0], self._venue_available_ids()))
+        elif len(tokens) >= 2:
+            found = self._venue_find_history_target(tokens[0])
+            if found is None:
+                self.ui.display_warning(
+                    name, agent_id,
+                    "No agent matches ID '%s'. %s" % (tokens[0], self._venue_available_ids()))
+                return
+            target, label = found
+            size_token = tokens[1]
+        if size_token:
             try:
-                page_size = int(str(arg).strip())
+                page_size = int(size_token)
             except (TypeError, ValueError):
                 page_size = 10
         page_size = max(1, min(100, page_size))
-        total = len(self.history)
+        history = list(getattr(target, 'history', []) or [])
+        total = len(history)
         page = ((total + page_size - 1) // page_size) if total else 1
         while True:
-            text, page, pages = self._venue_history_page(page, page_size)
+            text, page, pages = self._venue_history_page(page, page_size, history, label)
             self.ui.interrupt_info(name, agent_id, 'Interrupt History', text)
-            raw = self.ui.interrupt_read('history> ')
+            raw = self.ui.interrupt_read('history! ')
             if raw is None:
                 return
             key = str(raw).strip()
@@ -2495,14 +2636,14 @@ class Agent:
             operand = parts[1].strip() if len(parts) > 1 else ''
             if verb == 'g':
                 try:
-                    target = int(operand)
+                    target_page = int(operand)
                 except (TypeError, ValueError):
                     self.ui.display_warning(name, agent_id, 'Usage: g <page>')
                     continue
-                if target < 1 or target > pages:
+                if target_page < 1 or target_page > pages:
                     self.ui.display_warning(
-                        name, agent_id, 'Page %d is out of range 1..%d.' % (target, pages))
-                page = max(1, min(target, pages))
+                        name, agent_id, 'Page %d is out of range 1..%d.' % (target_page, pages))
+                page = max(1, min(target_page, pages))
                 continue
             if verb == 'd':
                 try:
@@ -2510,10 +2651,10 @@ class Agent:
                 except (TypeError, ValueError):
                     self.ui.display_warning(name, agent_id, 'Usage: d <idx>')
                     continue
-                if idx < 0 or idx >= len(self.history):
+                if idx < 0 or idx >= len(history):
                     self.ui.display_warning(name, agent_id, 'No message at index %d.' % idx)
                     continue
-                msg = self.history[idx]
+                msg = history[idx]
                 role = str(msg.get('role') or '?')
                 self.ui.interrupt_info(
                     name, agent_id, 'Interrupt History [%d] %s' % (idx, role),
@@ -2556,7 +2697,7 @@ class Agent:
         lines.append('detached: ' + (', '.join(detached) if detached else 'none'))
         return chr(10).join(lines)
 
-    def _venue_compress(self, stage):
+    def _venue_compress(self, stage, level=None):
         """Force an immediate context compression and report the outcome."""
         name = self.config.name
         agent_id = self.agent_id
@@ -2564,40 +2705,376 @@ class Agent:
         before_count = self.compress_count
         stage_prompt = getattr(self, '_current_stage_prompt', '') or ''
         try:
-            rebuilt, _ = self._mid_loop_protection(
-                stage or {}, stage_prompt, self._current_turn, force=True)
+            if level == 1:
+                rebuilt, _ = self._force_l1_only()
+            elif level == 2:
+                rebuilt, _ = self._mid_loop_protection(
+                    stage or {}, stage_prompt, self._current_turn,
+                    force=True, force_l2=True)
+            else:
+                rebuilt, _ = self._mid_loop_protection(
+                    stage or {}, stage_prompt, self._current_turn, force=True)
         except Exception as exc:
             self.ui.display_warning(name, agent_id, 'compression failed: %s' % exc)
             return
         after = int(self._context_usage_ratio() * self.context_size)
-        report = ('compress: ~%d -> ~%d tokens (est.), delta ~%d, rebuilt=%s, count %d -> %d'
-                  % (before, after, before - after, bool(rebuilt),
+        suffix = '' if level is None else ' L%d' % level
+        report = ('compress%s: ~%d -> ~%d tokens (est.), delta ~%d, rebuilt=%s, count %d -> %d'
+                  % (suffix, before, after, before - after, bool(rebuilt),
                      before_count, self.compress_count))
         self.ui.interrupt_info(name, agent_id, 'Interrupt Compress', report)
 
-    def _venue_spawn(self, arg):
-        """Spawn a sub-agent from the venue and show its output."""
-        agent_class, _, task_text = str(arg).partition(' ')
-        digest = self._run_spawn_interrupt(agent_class, task_text)
-        if not digest:
-            self.ui.display_warning(
-                self.config.name, self.agent_id, 'Spawn produced no output.'
-            )
-            return
-        self.ui.interrupt_answer(self.config.name, self.agent_id, digest)
+    def _force_l1_only(self):
+        """Forced L1-only compression for the venue `/compress 1`.
 
-    def _serve_interrupt_venue(self, stage, stage_turn, tools_called, entry='loop'):
+        Runs the deterministic truncation of old tool results and NEVER escalates
+        to the L2 cold restart. Returns (False, turn) to match the
+        `_mid_loop_protection` shape (no history rebuild happens).
+        """
+        before = int(self._context_usage_ratio() * self.context_size)
+        truncated = self._truncate_old_tool_results()
+        after = int(self._context_usage_ratio() * self.context_size)
+        if truncated:
+            self.compress_count += 1
+            self._usage_is_predicted = True
+            note = ('L1 forced truncation: compressed %d tool result(s). '
+                    '~%d -> ~%d tokens (est.).' % (truncated, before, after))
+            self.logger.log_compression(note)
+            self.ui.display_compression(self.config.name, self.agent_id,
+                                        before, after, 'L1', self.compress_count)
+        return False, self._current_turn
+
+    def _venue_list(self, arg):
+        """Dispatch `/list <instance|agents>`."""
+        sub = str(arg or '').strip().lower()
+        if sub in ('instance', 'instances'):
+            self._venue_list_instances()
+            return
+        if sub in ('agents', 'agent', 'classes'):
+            self._venue_list_agents()
+            return
+        self.ui.display_warning(
+            self.config.name, self.agent_id, 'Usage: /list <instance|agents>')
+
+    def _venue_list_agents(self):
+        """List the live agent-class registry (mirrors the CLI --list agents)."""
+        classes = getattr(self, 'agent_classes', {}) or {}
+        current = str(getattr(self.config, 'name', '') or '')
+        items = []
+        for name in sorted(classes):
+            cfg = classes[name]
+            code = str(getattr(cfg, 'code', '') or '')
+            model = str(getattr(cfg, 'model', '') or '')
+            desc = str(getattr(cfg, 'description', '') or '')
+            if not desc:
+                prompt = str(getattr(cfg, 'system_prompt', '') or '')
+                if prompt.strip():
+                    desc = prompt.strip().splitlines()[0].strip()
+            label = name + (' (current)' if name == current else '')
+            items.append((label, code, model, desc))
+        self.ui.interrupt_list(
+            self.config.name, self.agent_id, 'Agent Classes', items,
+            ['Name', 'Code', 'Model', 'Description'])
+
+    @staticmethod
+    def _context_cell(agent):
+        """A compact 'NN%  used/window' context cell, guarded against stubs."""
+        if agent is None:
+            return '-'
+        try:
+            ratio = agent._context_usage_ratio()
+            window = int(getattr(agent, 'context_size', 0) or 0)
+            used = int(ratio * window)
+            return '%d%%  %d/%d' % (round(100 * ratio), used, window)
+        except Exception:
+            return '-'
+
+    def _venue_instance_rows(self):
+        """Rows describing every live agent instance the venue can see."""
+        rows = []
+        seen = set()
+        runtime = getattr(self, 'runtime', None)
+        pool = getattr(runtime, 'pool', None) if runtime is not None else None
+        for handle in list((pool or {}).values()):
+            agent = getattr(handle, 'agent', None)
+            hname = str(getattr(handle, 'name', '') or '?')
+            aid = str(getattr(agent, 'agent_id', '') or '?') if agent is not None else '?'
+            cls = str(getattr(getattr(agent, 'config', None), 'name', '') or '?')
+            status = str(getattr(handle, 'status', '') or '?')
+            wait = str(getattr(handle, 'wait_event', '') or '-') or '-'
+            rows.append((hname, cls, aid, status, wait, self._context_cell(agent)))
+            seen.add(aid)
+            seen.add(hname)
+        # Pushed venue frames (the /spawn stack) that are not yet in the pool.
+        for frame in list(getattr(self, '_venue_stack', []) or []):
+            if not isinstance(frame, dict):
+                continue
+            agent = frame.get('agent')
+            if agent is None:
+                continue
+            aid = str(getattr(agent, 'agent_id', '') or '?')
+            if aid in seen:
+                continue
+            cls = str(getattr(getattr(agent, 'config', None), 'name', '') or '?')
+            handle = frame.get('handle')
+            status = 'spawned' if not handle else 'running'
+            rows.append((str(frame.get('name') or aid), cls, aid, status, '-',
+                         self._context_cell(agent)))
+            seen.add(aid)
+        # Always include the venue's own agent, even without a runtime.
+        if self.agent_id not in seen:
+            rows.append((
+                'self', str(getattr(self.config, 'name', '') or '?'), self.agent_id,
+                'running', '-', self._context_cell(self)))
+        return rows
+
+    def _venue_list_instances(self):
+        """List every concurrent agent instance (class, id, status, wait, ctx)."""
+        runtime = getattr(self, 'runtime', None)
+        pool = getattr(runtime, 'pool', None) if runtime is not None else None
+        rows = self._venue_instance_rows()
+        if not pool:
+            self.ui.interrupt_info(
+                self.config.name, self.agent_id, 'Agent Instances',
+                'no multi-agent runtime - single agent')
+            self.ui.interrupt_list(
+                self.config.name, self.agent_id, 'Instances', rows,
+                ['Instance', 'Class', 'ID', 'Status', 'Wait Event', 'Context'])
+            return
+        active = ''
+        getter = getattr(runtime, 'active_name', None)
+        if callable(getter):
+            try:
+                active = str(getter() or '')
+            except Exception:
+                active = ''
+        head = 'instances: %d live  (max seen %s)' % (
+            len(pool), getattr(runtime, 'max_agents', '?'))
+        if active:
+            head += '  active: ' + active
+        self.ui.interrupt_info(
+            self.config.name, self.agent_id, 'Agent Instances', head)
+        self.ui.interrupt_list(
+            self.config.name, self.agent_id, 'Instances', rows,
+            ['Instance', 'Class', 'ID', 'Status', 'Wait Event', 'Context'])
+
+    def _venue_load(self, arg):
+        """Dynamically load an extra Agent Class file (the venue /load command)."""
+        name = self.config.name
+        agent_id = self.agent_id
+        path = str(arg or '').strip()
+        if not path:
+            self.ui.display_warning(name, agent_id, 'Usage: /load <path>')
+            return
+        loader = getattr(self, 'yaha_load_classes', None)
+        if loader is None:
+            self.ui.display_warning(
+                name, agent_id, 'class loading is not available in this context')
+            return
+        try:
+            report = loader(path)
+        except Exception as exc:
+            self.ui.display_warning(name, agent_id, 'load failed: %s' % exc)
+            return
+        text = str(report or '').strip() or 'load: done'
+        low = text.lower()
+        if (low.startswith('load: file not found')
+                or low.startswith('load: parse error')
+                or low.startswith('load: no path')
+                or low.startswith('load: no agent classes')):
+            self.ui.display_warning(name, agent_id, text)
+            return
+        self.ui.interrupt_info(name, agent_id, 'Interrupt Load', text)
+
+    def _venue_spawn_frame(self, arg, frames):
+        """`/spawn <Class> <task>`: push a frame and enter the child's venue.
+
+        The child is CREATED but not run: a `/resume` inside its venue runs it.
+        On return the frame is popped (in a finally, so an exception cannot leave
+        a stale frame) and control returns to this venue.
+        """
+        name = self.config.name
+        agent_id = self.agent_id
+        agent_class, _, task_text = str(arg).partition(' ')
+        agent_class = agent_class.strip()
+        task_text = task_text.strip()
+        if not agent_class:
+            self.ui.display_warning(name, agent_id, 'Usage: /spawn <AgentClass> <task>')
+            return
+        factory = getattr(self, 'yaha_spawn_frame', None)
+        if factory is None:
+            self.ui.display_warning(name, agent_id, 'spawning is not available in this context')
+            return
+        runtime = getattr(self, 'runtime', None)
+        try:
+            child = factory(agent_class, runtime)
+        except Exception as exc:
+            self.ui.display_warning(name, agent_id, 'spawn failed: %s' % exc)
+            return
+        if child is None or isinstance(child, str):
+            self.ui.display_warning(name, agent_id, str(child or 'spawn produced no child'))
+            return
+        frame = {
+            'agent': child,
+            'task': task_text,
+            'handle': None,
+            'name': '%s/%s' % (getattr(child.config, 'name', agent_class), child.agent_id),
+        }
+        frames.append(frame)
+        try:
+            self.ui.interrupt_note(
+                name, agent_id,
+                'pushed frame %d: %s (%s); /resume runs it, /quit pops it.'
+                % (len(frames), frame['name'], agent_class))
+            child._serve_interrupt_venue(
+                {'name': 'Spawned'}, 0, set(), entry='spawn',
+                frames=frames, spawned=True)
+        finally:
+            if frames and frames[-1] is frame:
+                frames.pop()
+        self.ui.interrupt_note(name, agent_id, 'popped frame: %s' % frame['name'])
+
+    @staticmethod
+    def _venue_group_waits(runtime, handle_name):
+        """The parked event name(s) for a frame's runtime group, or ''."""
+        waiting = getattr(runtime, 'waiting', None) or {}
+        names = []
+        for event, handles in waiting.items():
+            for handle in handles:
+                if getattr(handle, 'name', None) == handle_name:
+                    names.append(str(event))
+        return ', '.join(sorted(set(names)))
+
+    def _run_spawned_frame(self, frames, steer=None):
+        """Run the CURRENT spawned frame's child; return True to POP the frame.
+
+        With a runtime the child (and any parallel peers it starts) is driven by
+        the scoped `runtime.run_group`; a completed group pops the frame, a
+        channel-block keeps it (never a deadlock). Without a runtime the child
+        runs synchronously.
+        """
+        name = self.config.name
+        agent_id = self.agent_id
+        frame = frames[-1] if frames else None
+        task = ''
+        if isinstance(frame, dict):
+            task = str(frame.get('task') or '')
+        steer_text = str(steer or '').strip()
+        if steer_text:
+            if task:
+                task = task + chr(10) + chr(10) + 'Operator steer: ' + steer_text
+            else:
+                task = steer_text
+        runtime = getattr(self, 'runtime', None)
+        pool = getattr(runtime, 'pool', None) if runtime is not None else None
+        if runtime is not None and pool is not None:
+            handle = frame.get('_handle') if isinstance(frame, dict) else None
+            if handle is None:
+                try:
+                    handle = runtime.spawn(self, task)
+                except Exception as exc:
+                    self.ui.display_warning(name, agent_id, 'spawn run failed: %s' % exc)
+                    return True
+                if isinstance(frame, dict):
+                    # Retain the OBJECT, not just its name: the runtime removes a
+                    # finished handle from `pool`, but the object still carries
+                    # the child's final `result`.
+                    frame['_handle'] = handle
+                    frame['handle'] = getattr(handle, 'name', None)
+            handle_name = getattr(handle, 'name', None)
+            try:
+                outcome = runtime.run_group([handle_name])
+            except Exception as exc:
+                self.ui.display_warning(name, agent_id, 'group run failed: %s' % exc)
+                return True
+            if outcome == 'empty':
+                result = str(getattr(handle, 'result', '') or '')
+                self.ui.interrupt_note(
+                    name, agent_id,
+                    'spawned %s finished: %s' % (name, result[:400] if result else 'done'))
+                return True
+            waits = self._venue_group_waits(runtime, handle_name)
+            self.ui.interrupt_note(
+                name, agent_id,
+                'frame group blocked on %s; /resume to continue, /quit to pop.'
+                % (waits or 'an event'))
+            return False
+        # No runtime: a plain synchronous nested run.
+        try:
+            with self.ui.spinner('Running spawned %s...' % name):
+                result = self.run(task)
+        except Exception as exc:
+            self.ui.display_warning(name, agent_id, 'spawn run failed: %s' % exc)
+            return True
+        self.ui.interrupt_note(
+            name, agent_id, 'spawned %s finished: %s' % (name, str(result or 'done')[:400]))
+        return True
+
+    def _venue_agent_stack(self, frames):
+        """Render the spawn CALL stack (the venue frames)."""
+        name = self.config.name
+        agent_id = self.agent_id
+        frames = list(frames or [])
+        if not frames:
+            self.ui.interrupt_info(
+                name, agent_id, 'Agent Stack',
+                'no spawn frames - root only (%s/%s)' % (name, agent_id))
+            return
+        runtime = getattr(self, 'runtime', None)
+        rows = []
+        for idx, frame in enumerate(frames):
+            agent = frame.get('agent') if isinstance(frame, dict) else None
+            fname = str((frame.get('name') if isinstance(frame, dict) else None) or '?')
+            cls = str(getattr(getattr(agent, 'config', None), 'name', '') or '?')
+            aid = str(getattr(agent, 'agent_id', '') or '?')
+            handle = frame.get('handle') if isinstance(frame, dict) else None
+            is_root = bool(frame.get('root')) if isinstance(frame, dict) else False
+            if is_root:
+                state = 'root'
+            elif handle:
+                state = 'handle:' + str(handle)
+            else:
+                state = 'pending'
+            waits = self._venue_group_waits(runtime, handle) if handle else ''
+            cell = fname + (' <- current' if idx == len(frames) - 1 else '')
+            rows.append((str(idx + 1), cell, cls, aid, state, waits or '-'))
+        if len(rows) <= 1:
+            head = 'spawn stack: root only (no spawn frames)'
+        else:
+            head = 'spawn stack: %d frame(s) (1 = root, top is current)' % len(rows)
+        self.ui.interrupt_info(name, agent_id, 'Agent Stack', head)
+        self.ui.interrupt_list(
+            name, agent_id, 'Frames', rows,
+            ['#', 'Frame', 'Class', 'ID', 'State', 'Wait'])
+
+    def _serve_interrupt_venue(self, stage, stage_turn, tools_called, entry='loop',
+                               frames=None, spawned=False):
         """Run the interrupt diagnose venue until a flow command is chosen.
 
         The venue is a REPL: a line WITHOUT a leading slash is a question to the
         model and never changes the chain; only a slash command changes the
         execution flow. Returns a VenueResult.
+
+        `frames` is the shared spawn STACK: the root call seeds it with a root
+        frame, and every `/spawn`ed child venue is entered with the SAME list, so
+        nested frames form one stack. `spawned` marks a child call: there `/quit`
+        POPS (returns STATUS_POP) instead of ending the chain, and `/resume` runs
+        the frame's child.
         """
         if not sys.stdin.isatty():
             # Non-TTY / unattended: never block and never call the model.
             return VenueResult(ic.STATUS_RESUME, None, None)
+        if frames is None:
+            frames = [{
+                'agent': self,
+                'task': getattr(self, 'current_task_prompt', '') or '',
+                'handle': None,
+                'name': '%s/%s' % (self.config.name, self.agent_id),
+                'root': True,
+            }]
         self._serving_interrupt = True
         self._venue_entry = entry
+        self._venue_stack = frames
         self._interrupt_suspend()
         transcript = []
         name = self.config.name
@@ -2608,7 +3085,10 @@ class Agent:
             while True:
                 raw = self.ui.interrupt_read()
                 if raw is None:
-                    # EOF / Ctrl-D is an explicit act: leave by resuming.
+                    # EOF / Ctrl-D is an explicit act: pop a child frame, or
+                    # resume at the root frame.
+                    if spawned:
+                        return VenueResult(ic.STATUS_POP, None, None)
                     return VenueResult(ic.STATUS_RESUME, None, None)
                 line = str(raw).strip()
                 if not line:
@@ -2644,7 +3124,10 @@ class Agent:
                     self._venue_call(arg)
                     continue
                 if spec.name == 'spawn':
-                    self._venue_spawn(arg)
+                    self._venue_spawn_frame(arg, frames)
+                    continue
+                if spec.name == 'agent_stack':
+                    self._venue_agent_stack(frames)
                     continue
                 if spec.name == 'history':
                     self._venue_history_browser(arg)
@@ -2658,10 +3141,39 @@ class Agent:
                                            self._venue_chain_report(stage))
                     continue
                 if spec.name == 'compress':
-                    self._venue_compress(stage)
+                    level = None
+                    if arg is not None:
+                        token = str(arg).strip()
+                        if token in ('1', '2'):
+                            level = int(token)
+                        else:
+                            self.ui.display_warning(
+                                name, agent_id, 'Usage: ' + ic.usage_of(spec))
+                            continue
+                    self._venue_compress(stage, level)
+                    continue
+                if spec.name == 'list':
+                    self._venue_list(arg)
+                    continue
+                if spec.name == 'load':
+                    self._venue_load(arg)
                     continue
 
+                if spawned and spec.name in ('rewind', 'restart', 'jump'):
+                    # Chain moves would otherwise fall through to the generic
+                    # return and be discarded while the frame still pops.
+                    self.ui.display_warning(
+                        name, agent_id,
+                        "'/%s' is not available inside a spawned frame; "
+                        "/quit to return first." % spec.name)
+                    continue
                 if spec.name == 'resume':
+                    if spawned:
+                        # A spawned frame's /resume RUNS its child; a completed
+                        # group then pops the frame back to the parent venue.
+                        if self._run_spawned_frame(frames, arg):
+                            return VenueResult(ic.STATUS_POP, None, None)
+                        continue
                     self.ui.interrupt_note(
                         name, agent_id,
                         f"Resuming stage '{stage_name}' at turn {self._current_turn}.",
@@ -2670,6 +3182,10 @@ class Agent:
                 if spec.name == 'jump':
                     return VenueResult(ic.STATUS_JUMP + ':' + str(arg), arg, None)
                 if spec.name == 'quit':
+                    if spawned:
+                        # A child frame's /quit POPS one frame; only the root
+                        # frame routes to the fail target and finishes the run.
+                        return VenueResult(ic.STATUS_POP, None, None)
                     return VenueResult(ic.STATUS_FAIL + ':' + self._quit_target(stage), arg, None)
                 return VenueResult(spec.status, arg, None)
         finally:
@@ -3573,7 +4089,7 @@ class Agent:
                 pass
         return text
 
-    def _mid_loop_protection(self, stage, stage_prompt, turn, force=False):
+    def _mid_loop_protection(self, stage, stage_prompt, turn, force=False, force_l2=False):
         """High-water safety net inside a long-running stage (not Snap boundary).
 
         This is the STRICT net: it fires at HARD_FORCE_RATIO and it fires regardless of
@@ -3585,6 +4101,8 @@ class Agent:
 
         Uses the formal detached handler when the class config has one; otherwise falls
         back to the legacy `_compress_context` so non-snap-policy configs keep working.
+        `force_l2` forces the L2 escalation even when the L1 pass was sufficient
+        (the venue `/compress 2`).
 
         Returns (history_was_rebuilt, turn)."""
         ratio = self._context_usage_ratio()
@@ -3606,7 +4124,7 @@ class Agent:
             handler = (self.config.detached_stages or {}).get(handler_name)
         if not handler:
             # No formal handler/policy: preserve legacy paths/tests.
-            return self._compress_context(stage, stage_prompt, turn)
+            return self._compress_context(stage, stage_prompt, turn, force_l2=force_l2)
 
         # Deterministic L1 truncation first; if that is enough, log it and keep the
         # running stage untouched. The re-check uses the SAME instrument as the trigger
@@ -3614,7 +4132,7 @@ class Agent:
         # switching units mid-decision is what made L1 look sufficient when it was not.
         truncated = self._truncate_old_tool_results()
         after_l1 = self._context_usage_ratio()
-        if self._l1_sufficient(after_l1, bar):
+        if not force_l2 and self._l1_sufficient(after_l1, bar):
             if truncated:
                 self.compress_count += 1
                 after_tokens = int(after_l1 * self.context_size)
@@ -3806,13 +4324,14 @@ class Agent:
             return None, turn
         return digest.strip(), turn
 
-    def _compress_context(self, stage, stage_prompt, turn):
+    def _compress_context(self, stage, stage_prompt, turn, force_l2=False):
         """Two-level compression pipeline for classes WITHOUT a Snap handler.
 
         Run L1 (best-effort truncation), check the configured Snap To target, and only
         escalate to L2 (reflection + cold restart) if L1 alone is not enough. The
         sufficiency decision goes through the shared `_l1_sufficient` helper with the
         target passed explicitly, instead of a hard-coded 0.4. Compression is unlimited.
+        `force_l2` skips the L1-sufficiency gate and always runs L2 (venue `/compress 2`).
 
         Returns (history_was_rebuilt, turn)."""
         self._compressing = True
@@ -3830,7 +4349,7 @@ class Agent:
             # never mistaken for steps.
             steps = self._recent_react_steps(self._compression_keep_steps())
 
-            if self._l1_sufficient(after_l1, target):
+            if not force_l2 and self._l1_sufficient(after_l1, target):
                 self.compress_count += 1
                 self._usage_is_predicted = True
                 note = (f"L1 truncation: compressed {compressed_n} tool result(s). "

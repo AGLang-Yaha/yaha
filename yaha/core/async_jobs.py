@@ -55,14 +55,22 @@ class AsyncJob:
     ``status`` walks PENDING -> RUNNING -> DONE/ERROR/CANCELLED. ``proc`` holds
     the live ``Popen`` (set by the runner) so ``shutdown`` can kill a child that
     would otherwise outlive an aborted run.
+
+    ``cmdline`` is what the worker RUNS; it may be a sandbox wrapper. The
+    separate ``display_cmdline`` is the same command AS THE CALLER WROTE IT,
+    and it is what the result the agent eventually reads echoes back - so a
+    result that outlives history compression still names its command.
     """
 
-    __slots__ = ("job_id", "cmdline", "owner", "status", "output",
-                 "error", "started_at", "finished_at", "delivered", "proc")
+    __slots__ = ("job_id", "cmdline", "display_cmdline", "owner", "status",
+                 "output", "error", "started_at", "finished_at", "delivered",
+                 "proc", "finished_event")
 
-    def __init__(self, job_id, cmdline, owner=None):
+    def __init__(self, job_id, cmdline, owner=None, display_cmdline=None):
         self.job_id = job_id
         self.cmdline = cmdline
+        self.display_cmdline = (display_cmdline if display_cmdline is not None
+                                else cmdline)
         self.owner = owner
         self.status = PENDING
         self.output = ""
@@ -71,6 +79,9 @@ class AsyncJob:
         self.finished_at = None
         self.delivered = False
         self.proc = None
+        # Set by ``finish`` the instant this job reaches a terminal state, so
+        # ``AsyncJobRegistry.wait`` can park a caller without busy-polling.
+        self.finished_event = threading.Event()
 
     def finish(self, status, output="", error=None):
         """Record the terminal state (called once, by the worker thread).
@@ -94,6 +105,9 @@ class AsyncJob:
         self.finished_at = time.monotonic()
         # Terminal status LAST - see PUBLICATION ORDER above.
         self.status = status
+        # Wake any parked waiter only AFTER the terminal status is visible, so
+        # a caller released by the event always reads the finished snapshot.
+        self.finished_event.set()
         return self
 
     def elapsed(self):
@@ -106,6 +120,7 @@ class AsyncJob:
         return {
             "job_id": self.job_id,
             "cmdline": self.cmdline,
+            "display_cmdline": self.display_cmdline,
             "status": self.status,
             "output": self.output,
             "error": self.error,
@@ -135,28 +150,39 @@ class AsyncJobRegistry:
         self._wake = wake
         self._runner = runner
 
-    def allocate(self, cmdline, owner=None):
+    def allocate(self, cmdline, owner=None, display_cmdline=None):
         """Reserve a fresh job id and return the (not yet started) job.
 
         ``owner`` is the agent id that started the job; it is only used to
         scope the opportunistic drain, never the wait-by-id (any peer may
         park on any live job id).
+
+        ``display_cmdline`` (see ``AsyncJob``) is the caller-facing form of the
+        command, used when the result is shown back to the agent; it defaults
+        to ``cmdline``, the command that actually runs.
         """
         with self._lock:
             job_id = "%s%d" % (JOB_ID_PREFIX, next(self._counter))
-            job = AsyncJob(job_id, cmdline, owner=owner)
+            job = AsyncJob(job_id, cmdline, owner=owner,
+                           display_cmdline=display_cmdline)
             self._jobs[job_id] = job
             self._order.append(job_id)
             return job
 
-    def start(self, cmdline, runner=None, owner=None):
+    def start(self, cmdline, runner=None, owner=None, display_cmdline=None):
         """Allocate a job and launch it on a daemon worker thread.
 
         The status is flipped to RUNNING BEFORE the thread starts, so a
         scheduler that checks liveness immediately after this returns can never
         observe the job as finished-and-lost.
+
+        ``display_cmdline`` is the command AS THE CALLER WROTE IT, kept for the
+        result the agent eventually reads (see ``AsyncJob.display_cmdline``);
+        ``cmdline`` remains the command that actually runs, which may be a
+        sandbox wrapper.
         """
-        job = self.allocate(cmdline, owner=owner)
+        job = self.allocate(cmdline, owner=owner,
+                            display_cmdline=display_cmdline)
         run = runner or self._runner
         job.status = RUNNING
         job.started_at = time.monotonic()
@@ -198,6 +224,21 @@ class AsyncJobRegistry:
         """Snapshot of one job, or None when the id is unknown."""
         job = self.get(job_id)
         return job.snapshot() if job is not None else None
+
+    def wait(self, job_id, timeout=None):
+        """Block until the job is terminal, or ``timeout`` seconds elapse.
+
+        Returns the job's snapshot, or None when the id is unknown. A job that
+        already finished returns immediately (its ``finished_event`` is already
+        set). ``timeout=None`` blocks until the job finishes; callers that must
+        not block forever pass a positive number of seconds. A timeout NEVER
+        cancels the job - it simply returns the still-running snapshot.
+        """
+        job = self.get(job_id)
+        if job is None:
+            return None
+        job.finished_event.wait(timeout)
+        return job.snapshot()
 
     def is_live(self, job_id):
         """True while the named job is still running (the deadlock predicate)."""

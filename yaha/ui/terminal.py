@@ -393,6 +393,8 @@ class YAHAUI:
                 summary = args.get("cmdline", "")
             elif tool_name == "poll_async":
                 summary = args.get("job_id", "")
+                if args.get("timeout"):
+                    summary = "%s (timeout %ss)" % (summary, args["timeout"])
 
             prefix = f"  {tool_name} "
             tool_line = Text(prefix, style="yellow")
@@ -618,13 +620,16 @@ class YAHAUI:
         self.console.print(str(text))
         self.console.print()
 
-    def interrupt_read(self, prompt="> "):
+    def interrupt_read(self, prompt="! "):
         """Read one venue line.
 
         Returns None on EOF / Ctrl-D / Ctrl-C so the venue can leave by
         resuming instead of blocking. Raw text is returned unstripped; the
         caller normalizes it. The prompt is plain text so readline (which owns
         the cursor) can measure it correctly.
+
+        The venue uses a `!` prompt char (default `"! "`) so it is
+        visually distinct from the normal `"> "` ask_user prompt.
         """
         try:
             return input(prompt)
@@ -653,6 +658,24 @@ class YAHAUI:
         """Print a titled read-only info panel (venue /history, /memory, ...)."""
         self._interrupt_rule(agent_name, agent_id, str(title), 'bold blue')
         self.console.print(str(text))
+        self.console.print()
+
+    def interrupt_list(self, agent_name, agent_id, title, items, columns=None):
+        """Print a titled read-only table under an interrupt rule (venue /list)."""
+        self._interrupt_rule(agent_name, agent_id, str(title), 'bold blue')
+        rows = list(items or [])
+        if not rows:
+            self.console.print('(none)', style='yellow')
+            self.console.print()
+            return
+        from rich.table import Table
+        table = Table(box=MINIMAL, expand=True)
+        for col in (columns or ['Name']):
+            table.add_column(str(col), style='cyan')
+        for row in rows:
+            cells = row if isinstance(row, (list, tuple)) else [row]
+            table.add_row(*[self._fit_text(str(c), max_lines=3) for c in cells])
+        self.console.print(table)
         self.console.print()
 
     def interrupt_note(self, agent_name, agent_id, text):

@@ -20,7 +20,7 @@ every other model keeps the hard "Malformed tool call" error.
 import types
 import unittest
 
-from yaha.core.agent import Agent, _parse_dsml_invoke, _DSML_MODEL_NAMES
+from yaha.core.agent import Agent, _parse_dsml_invoke, _dsml_coerce, _DSML_MODEL_NAMES
 from yaha.config.models import ModelConfig
 
 
@@ -169,6 +169,132 @@ def test_non_dict_dsml_args_still_errors_even_when_accommodated():
     print('test_non_dict_dsml_args_still_errors_even_when_accommodated OK')
 
 
+# --- DSML string="false" parameter typing ------------------------------------
+
+DSML_SET_EVENT_EXAMPLE = (
+    '<｜｜DSML｜｜ calls>\n'
+    '<｜｜DSML｜｜ invoke name="set_event_success">\n'
+    '<｜｜DSML｜｜ parameter name="names" string="false">["commit_done"]</｜｜DSML｜｜ parameter>\n'
+    '<｜｜DSML｜｜ parameter name="summary" string="true">Gated commit done.</｜｜DSML｜｜ parameter>\n'
+    '</｜｜DSML｜｜ invoke>\n'
+    '</｜｜DSML｜｜ calls>'
+)
+
+
+def test_parse_named_parameter_string_false_parses_list():
+    parsed = _parse_dsml_invoke(DSML_SET_EVENT_EXAMPLE)
+    assert parsed is not None, parsed
+    assert parsed['tool'] == 'set_event_success', parsed
+    assert parsed['args']['names'] == ['commit_done'], parsed
+    assert isinstance(parsed['args']['names'], list), parsed
+    assert parsed['args']['summary'] == 'Gated commit done.', parsed
+    print('test_parse_named_parameter_string_false_parses_list OK')
+
+
+def test_parse_named_parameter_string_true_stays_string():
+    text = (
+        '<｜｜DSML｜｜ invoke name="read_file">\n'
+        '<｜｜DSML｜｜ parameter name="path" string="true">README.md</｜｜DSML｜｜ parameter>\n'
+        '</｜｜DSML｜｜ invoke>'
+    )
+    parsed = _parse_dsml_invoke(text)
+    assert parsed == {'tool': 'read_file', 'args': {'path': 'README.md'}}, parsed
+    print('test_parse_named_parameter_string_true_stays_string OK')
+
+
+def test_parse_named_parameter_string_missing_stays_string():
+    text = (
+        '<｜｜DSML｜｜ invoke name="read_file">\n'
+        '<｜｜DSML｜｜ parameter name="path">README.md</｜｜DSML｜｜ parameter>\n'
+        '</｜｜DSML｜｜ invoke>'
+    )
+    parsed = _parse_dsml_invoke(text)
+    assert parsed == {'tool': 'read_file', 'args': {'path': 'README.md'}}, parsed
+    print('test_parse_named_parameter_string_missing_stays_string OK')
+
+
+def test_parse_named_parameter_string_false_parses_scalars():
+    text = (
+        '<｜｜DSML｜｜ invoke name="spawn_parallel_agent">\n'
+        '<｜｜DSML｜｜ parameter name="clone_context" string="false">42</｜｜DSML｜｜ parameter>\n'
+        '</｜｜DSML｜｜ invoke>'
+    )
+    parsed = _parse_dsml_invoke(text)
+    assert parsed['args']['clone_context'] == 42, parsed
+    assert isinstance(parsed['args']['clone_context'], int), parsed
+    print('test_parse_named_parameter_string_false_parses_scalars OK')
+
+
+def test_parse_args_blob_contract_unchanged():
+    text = (
+        '<｜｜DSML｜｜ invoke name="bash_tool">\n'
+        '<｜｜DSML｜｜ parameter name="args" string="false">[1, 2, 3]</｜｜DSML｜｜ parameter>\n'
+        '</｜｜DSML｜｜ invoke>'
+    )
+    assert _parse_dsml_invoke(text) is None
+    print('test_parse_args_blob_contract_unchanged OK')
+
+
+def test_dsml_coerce_falls_back_to_raw_string_on_decode_error():
+    from unittest.mock import patch
+    with patch('yaha.core.agent.json_repair.loads', side_effect=ValueError('boom')):
+        assert _dsml_coerce('[1, 2]', 'false') == '[1, 2]'
+    print('test_dsml_coerce_falls_back_to_raw_string_on_decode_error OK')
+
+
+def test_dsml_coerce_true_and_absent_keep_string():
+    assert _dsml_coerce('["a"]', 'true') == '["a"]'
+    assert _dsml_coerce('["a"]', '') == '["a"]'
+    assert _dsml_coerce('["a"]', 'false') == ['a']
+    print('test_dsml_coerce_true_and_absent_keep_string OK')
+
+
+def test_accommodated_set_event_call_yields_list_names():
+    agent = _agent(True)
+    tool, err = Agent.validate_response(agent, DSML_SET_EVENT_EXAMPLE)
+    assert err is None, err
+    assert tool is not None and tool['tool'] == 'set_event_success', tool
+    assert tool['args']['names'] == ['commit_done'], tool
+    print('test_accommodated_set_event_call_yields_list_names OK')
+
+
+def test_event_names_from_kwargs_repairs_json_array_string():
+    assert Agent._event_names_from_kwargs({'names': '["commit_done"]'}) == ['commit_done']
+    print('test_event_names_from_kwargs_repairs_json_array_string OK')
+
+
+def test_event_names_from_kwargs_keeps_plain_and_list():
+    assert Agent._event_names_from_kwargs({'names': 'commit_done'}) == ['commit_done']
+    assert Agent._event_names_from_kwargs({'names': ['a', 'b']}) == ['a', 'b']
+    print('test_event_names_from_kwargs_keeps_plain_and_list OK')
+
+
+def test_event_names_from_kwargs_numbered_names_still_work():
+    assert Agent._event_names_from_kwargs({'name1': 'a', 'name2': 'b'}) == ['a', 'b']
+    print('test_event_names_from_kwargs_numbered_names_still_work OK')
+
+
+def test_normalise_roundtrip_repairs_string():
+    collected = Agent._event_names_from_kwargs({'names': '["commit_done"]'})
+    assert Agent._normalise_event_names(collected) == ['commit_done']
+    print('test_normalise_roundtrip_repairs_string OK')
+
+
+def test_multi_name_json_string():
+    collected = Agent._event_names_from_kwargs({'names': '["a", "b", "a"]'})
+    assert Agent._normalise_event_names(collected) == ['a', 'b']
+    print('test_multi_name_json_string OK')
+
+
+def test_end_to_end_lead_dsml_call_signals_real_event():
+    parsed = _parse_dsml_invoke(DSML_SET_EVENT_EXAMPLE)
+    collected = Agent._event_names_from_kwargs(parsed['args'])
+    signalled = Agent._normalise_event_names(collected)
+    assert signalled == ['commit_done'], signalled
+    assert signalled != ['["commit_done"]'], signalled
+    print('test_end_to_end_lead_dsml_call_signals_real_event OK')
+
+
 class DsmlAccommodationTests(unittest.TestCase):
     '''Unittest-discoverable wrapper for the regression functions above.'''
     test_gate_model_names_are_exact = staticmethod(test_gate_model_names_are_exact)
@@ -184,6 +310,20 @@ class DsmlAccommodationTests(unittest.TestCase):
     test_accommodation_missing_flag_defaults_off = staticmethod(test_accommodation_missing_flag_defaults_off)
     test_dsml_with_leading_public_text = staticmethod(test_dsml_with_leading_public_text)
     test_non_dict_dsml_args_still_errors_even_when_accommodated = staticmethod(test_non_dict_dsml_args_still_errors_even_when_accommodated)
+    test_parse_named_parameter_string_false_parses_list = staticmethod(test_parse_named_parameter_string_false_parses_list)
+    test_parse_named_parameter_string_true_stays_string = staticmethod(test_parse_named_parameter_string_true_stays_string)
+    test_parse_named_parameter_string_missing_stays_string = staticmethod(test_parse_named_parameter_string_missing_stays_string)
+    test_parse_named_parameter_string_false_parses_scalars = staticmethod(test_parse_named_parameter_string_false_parses_scalars)
+    test_parse_args_blob_contract_unchanged = staticmethod(test_parse_args_blob_contract_unchanged)
+    test_dsml_coerce_falls_back_to_raw_string_on_decode_error = staticmethod(test_dsml_coerce_falls_back_to_raw_string_on_decode_error)
+    test_dsml_coerce_true_and_absent_keep_string = staticmethod(test_dsml_coerce_true_and_absent_keep_string)
+    test_accommodated_set_event_call_yields_list_names = staticmethod(test_accommodated_set_event_call_yields_list_names)
+    test_event_names_from_kwargs_repairs_json_array_string = staticmethod(test_event_names_from_kwargs_repairs_json_array_string)
+    test_event_names_from_kwargs_keeps_plain_and_list = staticmethod(test_event_names_from_kwargs_keeps_plain_and_list)
+    test_event_names_from_kwargs_numbered_names_still_work = staticmethod(test_event_names_from_kwargs_numbered_names_still_work)
+    test_normalise_roundtrip_repairs_string = staticmethod(test_normalise_roundtrip_repairs_string)
+    test_multi_name_json_string = staticmethod(test_multi_name_json_string)
+    test_end_to_end_lead_dsml_call_signals_real_event = staticmethod(test_end_to_end_lead_dsml_call_signals_real_event)
 
 
 if __name__ == '__main__':

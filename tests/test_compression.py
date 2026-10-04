@@ -118,6 +118,45 @@ class TestContextCompression(unittest.TestCase):
         self.assertIn("## Context Compressed", log)
         self.assertIn("L1 truncation", log)
 
+    def test_force_l1_only_truncates_without_restart(self):
+        agent = self._make_agent()
+        agent.context_size = 100000
+        big_result = "TOOL RESULT (bash_tool):\n- **Status**: SUCCESS\n- **Content**:\n```\n" + ("x" * 5000) + "\n```"
+        agent.history = [{"role": "system", "content": "sys"}]
+        for _ in range(3):
+            agent.history.append({"role": "assistant", "content": "calling tool"})
+            agent.history.append({"role": "user", "content": big_result})
+        agent.history.append({"role": "assistant", "content": "recent"})
+        agent.history.append({"role": "user", "content": "TOOL RESULT (bash_tool): small recent"})
+        agent.logger.set_task("task")
+
+        restarted, _ = agent._force_l1_only()
+
+        self.assertFalse(restarted)
+        self.assertEqual(agent.compress_count, 1)
+        self.assertTrue(agent.history[2]["content"].startswith("COMPRESSED TOOL RESULT"))
+        # L1 only: no L2 digest replaces the conversation.
+        self.assertFalse(any("CONTEXT DIGEST" in (m.get("content") or "") for m in agent.history))
+
+    def test_compress_context_force_l2_rebuilds_when_l1_would_suffice(self):
+        agent = self._make_agent()
+        agent.context_size = 1000000  # occupancy stays well under any target
+        agent.history = [{"role": "system", "content": "sys"},
+                         {"role": "assistant", "content": "a"},
+                         {"role": "user", "content": "b"}]
+        agent.logger.set_task("task")
+        agent._reflect_for_compression = lambda stage, turn: ("DIGEST TEXT", turn)
+
+        # Without force_l2, L1 alone suffices -> no cold restart.
+        restarted, _ = agent._compress_context({"name": "X"}, "stage prompt", 1)
+        self.assertFalse(restarted)
+        self.assertFalse(any("CONTEXT DIGEST" in (m.get("content") or "") for m in agent.history))
+
+        # force_l2 runs the L2 cold restart even though L1 was sufficient.
+        restarted2, _ = agent._compress_context({"name": "X"}, "stage prompt", 1, force_l2=True)
+        self.assertTrue(restarted2)
+        self.assertTrue(any("CONTEXT DIGEST" in (m.get("content") or "") for m in agent.history))
+
     def test_l2_cold_restart_and_memory_index_reload(self):
         agent = self._make_agent()
         agent.context_size = 1000  # trigger at 800 tokens; target 400 tokens

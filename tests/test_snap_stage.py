@@ -200,6 +200,25 @@ class TestSnapRuntime(unittest.TestCase):
         self.assertEqual(self.agent.llm.calls, 0)  # L1 was enough; no handler
         self.assertTrue(any("COMPRESSED TOOL RESULT" in (m.get("content") or "") for m in self.agent.history))
 
+    def test_mid_loop_force_l2_escalates_when_l1_sufficient(self):
+        # Without force_l2, L1 alone is enough -> the handler is never called.
+        self._reset(context_size=1600)
+        self._inject_old_tool_result()
+        self._set_occupancy(0.97)
+        rebuilt, _ = self.agent._mid_loop_protection(
+            {"name": "Coding", "snap": "disabled"}, "cont", 1)
+        self.assertFalse(rebuilt)
+        self.assertEqual(self.agent.llm.calls, 0)
+
+        # force_l2 forces the handler (L2) even though L1 was sufficient.
+        self._reset(context_size=1600)
+        self._inject_old_tool_result()
+        self._set_occupancy(0.97)
+        rebuilt2, _ = self.agent._mid_loop_protection(
+            {"name": "Coding", "snap": "disabled"}, "cont", 1, force_l2=True)
+        self.assertTrue(rebuilt2)
+        self.assertGreaterEqual(self.agent.llm.calls, 1)
+
     def test_mid_loop_handler_escalation(self):
         self._reset(context_size=200)
         self._set_occupancy(0.99)          # above the STRICT watermark, nothing to truncate
