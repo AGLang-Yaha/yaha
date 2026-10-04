@@ -159,6 +159,17 @@ class TestContextCompression(unittest.TestCase):
 
     def test_l2_cold_restart_and_memory_index_reload(self):
         agent = self._make_agent()
+        # The summary INSTRUCTIONS now come from the Compression stage content (the
+        # single source of truth), so this legacy (handler-less) class must declare
+        # one for L2 to run - exactly as a real AgentClass does.
+        agent.config.detached_stages = {
+            "Compression": {
+                "name": "Compression",
+                "content": ("Summarize the conversation in FEWER THAN 100 LINES with "
+                            "sections: GOAL / KEY LEARNINGS / DESIGN & ARCHITECTURE "
+                            "DECISIONS / PENDING / KEY FILES / ERRORS & LESSONS."),
+            },
+        }
         agent.context_size = 1000  # trigger at 800 tokens; target 400 tokens
         mock_llm = MockLLMProvider()
         # Real usage reports a nearly-full window after the first call
