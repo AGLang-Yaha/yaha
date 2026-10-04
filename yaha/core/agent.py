@@ -245,6 +245,31 @@ def _validate_tool_call_shape(parsed):
                           'inlined shape with the arguments as siblings of `tool`.'
                           % ', '.join(repr(k) for k in stray))
     return parsed, None
+
+
+def _dsml_attr(attrs, attr):
+    """Read one `name="value"` attribute out of a DSML parameter tag's attrs."""
+    match = re.search(attr + r'\s*=\s*"([^"]*)"', attrs, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+def _dsml_coerce(value, string_flag):
+    """Decode a DSML parameter value according to its `string` attribute.
+
+    `string="false"` marks a NON-string parameter (array, number, object): parse
+    it as JSON so the real type survives. Any other marker (`string="true"` or
+    absent) keeps the literal string. A `string="false"` value that does not
+    parse falls back to the raw string, so a malformed payload cannot crash the
+    parser.
+    """
+    if string_flag == "false":
+        try:
+            return json_repair.loads(value)
+        except Exception:
+            return value
+    return value
+
+
 def _parse_dsml_invoke(text):
     """Parse the FIRST DeepSeek DSML tool invoke into {"tool", "args"}.
 
@@ -257,7 +282,8 @@ def _parse_dsml_invoke(text):
         </｜｜DSML｜｜ calls>
 
     An `args` parameter holds the whole argument JSON; otherwise the named
-    parameters are collected into a plain string dict. Returns None when no
+    parameters are collected into a dict, JSON-decoding those marked
+    `string="false"` as non-string. Returns None when no
     usable invoke is present so the caller can keep its normal error path.
     """
     if not text:
@@ -272,21 +298,28 @@ def _parse_dsml_invoke(text):
     close = re.search(r"</" + _DSML_TAG + r"\s*invoke\s*>", text[invoke.end():], re.IGNORECASE)
     body = text[invoke.end():invoke.end() + close.start()] if close else text[invoke.end():]
     params = re.findall(
-        r"<" + _DSML_TAG + r"\s*parameter\s+name=\"([^\"]+)\"[^>]*>(.*?)</" + _DSML_TAG + r"\s*parameter\s*>",
+        r"<" + _DSML_TAG + r"\s*parameter\s+([^>]*)>(.*?)</" + _DSML_TAG + r"\s*parameter\s*>",
         body, re.IGNORECASE | re.DOTALL,
     )
+    named = []
+    for attrs, value in params:
+        pname = _dsml_attr(attrs, "name")
+        if pname is None:
+            continue
+        named.append((pname.strip(), value.strip(),
+                      (_dsml_attr(attrs, "string") or "").strip().lower()))
     args = {}
-    args_blob = next((v for k, v in params if k.strip().lower() == "args"), None)
+    args_blob = next((val for name, val, _flag in named if name.lower() == "args"), None)
     if args_blob is not None:
         try:
-            parsed = json_repair.loads(args_blob.strip())
+            parsed = json_repair.loads(args_blob)
         except Exception:
             return None
         if not isinstance(parsed, dict):
             return None
         args = parsed
     else:
-        args = {k.strip(): v.strip() for k, v in params}
+        args = {name: _dsml_coerce(value, flag) for name, value, flag in named}
     return {"tool": invoke.group(1), "args": args}
 
 
@@ -806,14 +839,29 @@ class Agent:
         """Pull event names out of a tool call's keyword arguments.
 
         The canonical JSON form carries `names` (a list). The tolerated forms
-        are numbered keys (name1, name2, ...) and a bare `name`. They may be
-        mixed in one call, because the MODEL writes these arguments, not a
-        schema validator.
+        are numbered keys (name1, name2, ...) and a bare `name`. A `names`
+        value that serialized into a JSON array string is decoded back into a
+        list, so a lost `string="false"` marker cannot turn one name into a JSON
+        literal. They may be mixed in one call, because the MODEL writes these
+        arguments, not a schema validator.
         """
         collected = []
         raw = (kwargs or {}).get('names')
         if isinstance(raw, (list, tuple, set)):
             collected.extend(raw)
+        elif isinstance(raw, str) and raw.lstrip().startswith('['):
+            # Defence in depth: a model may pass an already-serialized JSON array
+            # (e.g. a DSML `names` parameter whose `string="false"` marker was
+            # lost). Treat it as the list it clearly is, never as ONE literal
+            # event name - a garbage name would park nobody and deadlock the run.
+            try:
+                decoded = json_repair.loads(raw)
+            except Exception:
+                decoded = None
+            if isinstance(decoded, (list, tuple, set)):
+                collected.extend(decoded)
+            else:
+                collected.append(raw)
         elif raw is not None:
             collected.append(raw)
         numbered = []
