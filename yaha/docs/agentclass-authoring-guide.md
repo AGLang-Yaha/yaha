@@ -345,8 +345,13 @@ Context compression
 
 Long-horizon runs compress their context in one of two ways: a class-level Snap
 policy (`Snap Handler` / `Snap Threshold` / `Snap To`) whose detached handler
-produces the summary, or the built-in L2 reflection when no handler exists. Both
-rebuild the context from three parts, in order:
+produces the summary, or the L2 reflection fallback used when no handler exists.
+The `Compression` detached stage's own prompt text is the SINGLE source of truth
+for the summary instructions in BOTH paths: the runtime appends only a small
+dynamic header (the live context usage, the Snap target, and the current stage
+name) and never hard-codes the instruction prose itself, so editing that stage is
+enough to change what the model is asked for. Both rebuild the context from three
+parts, in order:
 
 1. the freshly built system prompt (the MEMORY INDEX is re-read),
 2. a compact summary of the prior conversation (asked to fit in fewer than 100
