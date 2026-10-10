@@ -136,6 +136,7 @@ Register or disable tools by editing `tool-schema.md`; add expert capabilities a
 ## 📖 Learn
 
 - [The AGLang white paper](yaha/docs/AOP-White-Paper.md) - the design and the buzzwords behind the language.
+- [The programming guide](yaha/docs/programming-guide.md) - hands-on AGLang/YAHA programming, from first agent to distributed crews.
 - [The AgentClass authoring guide](yaha/docs/agentclass-authoring-guide.md) - the full class/stage reference.
 - [Stage hooks](yaha/docs/hooks.md) - embedding Bash and Python in a stage.
 - [SOUL identity](yaha/docs/soul.md) - default and per-class identities.
