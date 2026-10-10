@@ -1,6 +1,11 @@
+<img align="left" src="assets/yaha-logo-small.png" alt="YAHA Logo" width="180"/>
+
 # Yet Another HArness (YAHA)
 
 YAHA is the open-source runtime for **AGLang**, an agent-oriented language in which a program is a set of Markdown agent classes. It runs as a command-line tool that turns a task into a structured execution trajectory: an agent loads its class, walks a prompt chain, calls tools, and can spawn further agents. The design rationale is in the white paper at [`yaha/docs/AOP-White-Paper.md`](yaha/docs/AOP-White-Paper.md).
+
+<br clear="both">
+
 
 ## 🚀 Core Principles
 
