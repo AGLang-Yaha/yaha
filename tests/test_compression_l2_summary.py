@@ -148,7 +148,10 @@ class TestL2Path(unittest.TestCase):
 
 
 class TestPrompts(unittest.TestCase):
-    def test_reflection_prompt_asks_for_under_100_lines(self):
+    # The summary INSTRUCTIONS come from the Compression stage content (the single
+    # source of truth), NOT from a hard-coded runtime prompt. The runtime appends
+    # only the dynamic values it owns. These guards pin that contract.
+    def test_reflection_prompt_uses_compression_stage_content(self):
         with AgentCase(context_size=400) as case:
             agent = case.agent
             agent.history = [
@@ -159,10 +162,13 @@ class TestPrompts(unittest.TestCase):
             agent.logger.set_task('task')
             agent._compress_context({'name': 'Coding'}, 'STAGE PROMPT', 1)
             prompt = agent.llm.sent[0][-1]['content']
-            self.assertIn('100', prompt)
-            self.assertIn('DESIGN & ARCHITECTURE DECISIONS', prompt)
+            # The fixture's Compression body is the marker 'handler body'.
+            self.assertIn('handler body', prompt)
+            self.assertIn('[COMPRESSION REQUEST]', prompt)
+            # The runtime must NOT re-author the hard-coded section list.
+            self.assertNotIn('using sections: GOAL,', prompt)
 
-    def test_snap_request_states_the_summary_spec(self):
+    def test_snap_prompt_uses_handler_content(self):
         with AgentCase(context_size=400) as case:
             agent = case.agent
             agent.history = [
@@ -171,8 +177,10 @@ class TestPrompts(unittest.TestCase):
             ]
             agent._maybe_snap({'name': 'Preamble', 'snap': 'enabled'}, 1, force=True)
             prompt = agent.llm.sent[0][-1]['content']
-            self.assertIn('DESIGN & ARCHITECTURE DECISIONS', prompt)
-            self.assertIn('100', prompt)
+            self.assertIn('handler body', prompt)
+            self.assertIn('[SNAP REQUEST]', prompt)
+            self.assertIn("Stage 'Preamble' just completed.", prompt)
+            self.assertNotIn('using sections: GOAL,', prompt)
 
 
 class TestStepEndRecognition(unittest.TestCase):

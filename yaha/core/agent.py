@@ -69,6 +69,12 @@ COMPRESSION_KEEP_STEPS = 10
 # this many lines, and is hard-capped here at runtime as a safety net.
 COMPRESSION_SUMMARY_MAX_LINES = 100
 
+# Name of the detached stage that carries the summary instructions. The runtime
+# reads that stage's `content` as the ONE source of truth for the compression /
+# Snap prompt and appends only dynamic values (usage %, target %, stage name); it
+# authors no instruction prose itself.
+COMPRESSION_STAGE_NAME = "Compression"
+
 # DeepSeek flash models sometimes bypass the harness <tool_code> format and
 # emit their native DSML tool-call block instead. Accommodate that dialect for
 # exactly these model names (checked together with provider == "deepseek").
@@ -3992,17 +3998,15 @@ class Agent:
 
         before_tokens = int(ratio * self.context_size)
         target = (self.config.snap_to or 0.4)
+        # The summary INSTRUCTIONS live in the Compression detached stage's own
+        # content (the single source of truth, authored in the template). The runtime
+        # appends ONLY the dynamic values it owns - the live occupancy, the target,
+        # and the stage that just finished - so the instruction text is never
+        # duplicated (and can never drift) here.
         snap_prompt = ((handler.get("content") or "").strip()
                      + f"\n\n[SNAP REQUEST] Context usage is {ratio * 100:.0f}% "
                      + f"(target after snap: ~{target * 100:.0f}%). "
-                     + f"Stage '{stage_name}' just completed. Persist durable "
-                     + "facts/memory if needed, then reply with a plain-text summary of "
-                     + f"the conversation in FEWER THAN {COMPRESSION_SUMMARY_MAX_LINES} "
-                     + "LINES (aim for well under), using sections: GOAL, KEY LEARNINGS, "
-                     + "DESIGN & ARCHITECTURE DECISIONS (most important), PENDING, "
-                     + "KEY FILES, ERRORS & LESSONS. The summary replaces the prior "
-                     + "conversation; the most recent ReAct steps are kept after it "
-                     + "(subject to the L1 truncation rule).")
+                     + f"Stage '{stage_name}' just completed.")
 
         original_history = list(self.history)
         original_turn = turn
@@ -4284,35 +4288,49 @@ class Agent:
             count += 1
         return count
 
+    def _compression_handler(self):
+        """The detached stage that carries the summary INSTRUCTIONS, or None.
+
+        The `Compression` stage content (authored in the AgentClass template and
+        inherited by every class) is the SINGLE source of truth for the compression
+        prompt; the runtime never hard-codes that instruction text. The class-level
+        `Snap Handler` names it, and a stage literally named `Compression` is the
+        fallback for handler-less classes.
+        """
+        name = self.config.snap_handler or COMPRESSION_STAGE_NAME
+        stages = self.config.detached_stages or {}
+        handler = stages.get(name)
+        if handler is None and name != COMPRESSION_STAGE_NAME:
+            handler = stages.get(COMPRESSION_STAGE_NAME)
+        return handler
+
     def _reflect_for_compression(self, stage, turn):
         """L2: let the current agent reflect over the FULL history (prefix cache
         hit) and produce a structured digest. Memory write tools are allowed so
         durable facts land in .yaha/memory/ before the context is dropped.
+
+        The summary INSTRUCTIONS come from the `Compression` stage content (the
+        single source of truth); the runtime appends only the dynamic values it
+        owns (occupancy, target, stage name, original task). With no such stage the
+        caller keeps its L1-compressed history - (None, turn) is returned instead of
+        fabricating a hard-coded prompt.
         Returns the digest text, or None on failure."""
         stage_name = stage.get("name", "Stage")
+        handler = self._compression_handler()
+        base = (handler.get("content") or "").strip() if handler else ""
+        if not base:
+            return None, turn
+        ratio = self._context_usage_ratio()
+        target = self.config.snap_to if self.config.snap_to is not None else 0.4
         reflection_prompt = (
-            "CONTEXT COMPRESSION - REFLECTION\n"
-            "The conversation context is nearly full and is about to be compressed. "
-            f"You are currently in stage '{stage_name}' of your prompt chain.\n"
-            f"The original task was:\n{self.current_task_prompt}\n\n"
-            "Before replying, you MAY update your memory folder (.yaha/memory/) with any durable "
-            "facts, decisions, or lessons worth keeping across the compression (use write_file/append_file/edit_file). "
-            "Keep memory updates small and precise.\n\n"
-            "Then produce a COMPACT summary of the ENTIRE conversation so far in FEWER THAN "
-            f"{COMPRESSION_SUMMARY_MAX_LINES} LINES (aim for well under {COMPRESSION_SUMMARY_MAX_LINES}). "
-            "It will replace the earlier conversation, so keep only what is needed to continue.\n"
-            "Use EXACTLY these sections:\n"
-            "GOAL: the project/task goal and what you are trying to accomplish.\n"
-            "KEY LEARNINGS: the durable lessons from the work so far.\n"
-            "DESIGN & ARCHITECTURE DECISIONS: the important design/architecture choices that "
-            "have been made and why (MOST IMPORTANT - do not omit this section).\n"
-            "PENDING: what remains to be done, including the immediate next step.\n"
-            "KEY FILES: important files/paths touched or needed, with one-line notes.\n"
-            "ERRORS & LESSONS: failures encountered and how they were resolved (if any).\n\n"
-            "Your final plain-text reply (no tool call) is taken as the summary."
+            base
+            + f"\n\n[COMPRESSION REQUEST] Context usage is {ratio * 100:.0f}% "
+            + f"(target after compaction: ~{target * 100:.0f}%). "
+            + f"You are in stage '{stage_name}'. "
+            + f"The original task was:\n{self.current_task_prompt}"
         )
         reflection_stage = {
-            "name": "Compression",
+            "name": COMPRESSION_STAGE_NAME,
             "content": reflection_prompt,
             "allowed_tools": ["read_file", "write_file", "append_file", "edit_file",
                               "list_files", "grep_files", "search_files"],
